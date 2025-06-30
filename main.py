@@ -10,23 +10,6 @@ from PyQt5.QtGui import QColor
 GOOD  = QColor("#C6EFCE")   # мягко-зелёный
 BAD   = QColor("#FFC7CE")   # мягко-красный
 
-def recheck_column(self, col, nominal, tol):
-    lo, hi = nominal - tol, nominal + tol
-    for r in range(self.rowCount()):
-        it = self.item(r, col)
-        if it is None:
-            continue
-        try:
-            v = float(it.text())
-        except ValueError:
-            # не число - вернём «родной» фон
-            it.setBackground(it.data(Qt.UserRole) or Qt.white)
-            continue
-
-        if lo <= v <= hi:
-            it.setBackground(GOOD)
-        else:
-            it.setBackground(BAD)
 
 def qcolor_hex(qc):
     return "#{:02x}{:02x}{:02x}".format(qc.red(), qc.green(), qc.blue())
@@ -90,18 +73,19 @@ def get_bg_hex(cell, ods_doc):
 
 # ---------- таблица, умеющая подсвечивать -------------------------------
 class ToleranceAwareTable(QTableWidget):
-    def recheck_column(self, col: int, nominal: float, tol: float):
-        low, high = nominal - tol, nominal + tol
+    def recheck_column(self, col: int, tol: float):
         for r in range(self.rowCount()):
             item = self.item(r, col)
             if item is None:
                 continue
             try:
                 v = float(item.text())
-            except ValueError:                # текст – пропускаем
+            except ValueError:              # в ячейке не число
                 item.setBackground(Qt.white)
                 continue
-            item.setBackground(Qt.green if low <= v <= high else Qt.red)
+
+            # |Δ| <= tol  → зелёный   |Δ| > tol → красный
+            item.setBackground(GOOD if abs(v) <= tol else BAD)
 
 # ---------- основное окно -----------------------------------------------
 class ODSViewer(QMainWindow):
@@ -150,14 +134,14 @@ class ODSViewer(QMainWindow):
 
     # -------- головная проверка изменения допусков ----------------------
     def _on_head_changed(self, row, col):
-        if row != 1:                 # 0 – номинал, 1 – допуск
+        if row != 1:                 # реагируем только на строку допуска
             return
         try:
-            nominal = float(self.head_table.item(0, col).text())
-            tol     = float(self.head_table.item(1, col).text())
+            tol = float(self.head_table.item(1, col).text())
         except (TypeError, ValueError):
             return
-        self.body_table.recheck_column(col, nominal, tol)
+        # вызываем с двумя аргументами
+        self.body_table.recheck_column(col, tol)
 
     # -------- отображение диапазона или всей таблицы --------------------
     def show_range(self):
@@ -196,11 +180,10 @@ class ODSViewer(QMainWindow):
         # ------ первая глобальная проверка ------------------------------
         for c in range(n_cols):
             try:
-                nominal = float(self.head_table.item(0, c).text())
-                tol     = float(self.head_table.item(1, c).text())
+                tol = float(self.head_table.item(1, c).text())
             except (TypeError, ValueError):
                 continue
-            self.body_table.recheck_column(c, nominal, tol)
+            self.body_table.recheck_column(c, tol)
 
 # ---------- main ---------------------------------------------------------
 if __name__ == '__main__':
