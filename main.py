@@ -14,30 +14,57 @@ BAD   = QColor("#FFC7CE")   # мягко-красный
 def qcolor_hex(qc):
     return "#{:02x}{:02x}{:02x}".format(qc.red(), qc.green(), qc.blue())
 
-def ensure_style(doc, hexclr, cache):
-    """
-    Возвращает имя стиля с заданной заливкой, добавляя его в
-    automatic_styles, если такого ещё нет.
-    """
-    if hexclr not in cache:
-        sname = f"bg_{hexclr.lstrip('#')}"
-        st = ezodf.Style(name=sname, family="table-cell")
-        st.set_property("fo:background-color", hexclr)       # :contentReference[oaicite:1]{index=1}
-        doc.automatic_styles.append(st)
-        cache[hexclr] = sname
-    return cache[hexclr]
+from typing import Callable
 
-def push_colors_back(self):
-    cache = {}
-    body_start = self.TOL_ROW + 1
-    for gui_row in range(self.body_table.rowCount()):
-        ods_row = body_start + gui_row
-        for col in range(self.body_table.columnCount()):
-            gui_it = self.body_table.item(gui_row, col)
-            hexclr  = qcolor_hex(gui_it.background().color())
-            ods_cell = self.sheet[ods_row, self.range_first_col + col]
-            style_name = ensure_style(self.ods_doc, hexclr, cache)
-            ods_cell.style_name = style_name
+try:                                     # 1. самый старый ezodf (<=0.3.0)
+    from ezodf import Style as EzStyle   # type: ignore
+    def _mk_cell_props(color: str, name: str):
+        st = EzStyle(name=name, family='table-cell')
+        st.set_property('fo:background-color', color)
+        return st
+
+except ImportError:
+    try:                                 # 2. «средний» ezodf (есть ezodf.style)
+        from ezodf.style import Style as EzStyle  # type: ignore
+        def _mk_cell_props(color: str, name: str):
+            st = EzStyle(name=name, family='table-cell')
+            st.set_property('fo:background-color', color)
+            return st
+
+    except ImportError:                  # 3. современный путь — odfpy
+        from odf.style import Style as EzStyle, TableCellProperties
+        def _mk_cell_props(color: str, name: str):
+            st = EzStyle(name=name, family='table-cell')
+            st.addElement(TableCellProperties(backgroundcolor=color))
+            return st
+
+def ensure_style(doc, hexclr: str, cache: dict[str, str]) -> str:
+    """
+    Гарантированно возвращает имя стиля с нужной заливкой,
+    создавая его при необходимости. Совместимо со старыми ezodf
+    (append) и pyexcel-ezodf / odfpy (addElement).
+    """
+    if hexclr in cache:
+        return cache[hexclr]
+
+    sname = f"bg_{hexclr.lstrip('#')}"
+    st = _mk_cell_props(hexclr, sname)
+
+    # ── выбираем коллекцию автоматических стилей ─────────────────────
+    auto = getattr(doc, "automatic_styles", None) or getattr(doc, "automaticstyles", None)
+    if auto is None:
+        # крайне редкий случай – у документа нет ни одного блока стилей
+        return sname   # просто пропускаем, без выброса исключения
+
+    # ── добавляем стиль подходящим методом ───────────────────────────
+    if hasattr(auto, "addElement"):        # odfpy / pyexcel-ezodf
+        auto.addElement(st)
+    else:                                  # старый ezodf: обычный list-like
+        auto.append(st)
+    # ─────────────────────────────────────────────────────────────────
+
+    cache[hexclr] = sname
+    return sname
             
 
 
@@ -121,27 +148,28 @@ class ODSViewer(QMainWindow):
 
         # ── служебное
         self.sheet = None
+        self.range_first_col = 0
 
         # связка: если меняется допуск -> перепроверяем столбец
         self.head_table.cellChanged.connect(self._on_head_changed)
 
+        self.btn_save = QPushButton('Сохранить как…')
+        vbox.addWidget(self.btn_save)
+        self.btn_save.clicked.connect(self.save_as)
+        self.btn_save.setEnabled(False)          # активируем только после открытия файла
+
     # -------- file open --------------------------------------------------
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, 'ODS', '', 'ODS (*.ods)')
-        if not path: return
-        self.sheet = ezodf.opendoc(path).sheets[0]
-        self.show_range()                     # сразу отрисовываем
+        if not path:
+            return
+        self.ods_doc = ezodf.opendoc(path)       # <── сохраняем документ
+        self.sheet   = self.ods_doc.sheets[0]
+        self.current_path = path
+        self.btn_save.setEnabled(True)
+        self.show_range()                   # сразу отрисовываем
 
-    # -------- головная проверка изменения допусков ----------------------
-    def _on_head_changed(self, row, col):
-        if row != 1:                 # реагируем только на строку допуска
-            return
-        try:
-            tol = float(self.head_table.item(1, col).text())
-        except (TypeError, ValueError):
-            return
-        # вызываем с двумя аргументами
-        self.body_table.recheck_column(col, tol)
+
 
     # -------- отображение диапазона или всей таблицы --------------------
     def show_range(self):
@@ -153,6 +181,13 @@ class ODSViewer(QMainWindow):
             fc, fr, tc, tr = parse_range(rng)
         else:
             fc, fr, tc, tr = 0, 0, self.sheet.ncols()-1, self.sheet.nrows()-1
+
+        self.range_first_col = fc
+
+        
+
+        # на время массового заполнения «шапки» отключаем сигнал
+        self.head_table.blockSignals(True)
 
         # ------ кол-во столбцов -----------------------------------------
         n_cols = tc - fc + 1
@@ -166,6 +201,8 @@ class ODSViewer(QMainWindow):
             # допуск
             tol_val = self.sheet[self.TOL_ROW, fc + c].value
             self.head_table.setItem(1, c, QTableWidgetItem(str(tol_val) if tol_val else ''))
+        
+        self.head_table.blockSignals(False) 
 
         # ------ заполняем body_table ------------------------------------
         data_start = self.TOL_ROW + 1
@@ -184,6 +221,56 @@ class ODSViewer(QMainWindow):
             except (TypeError, ValueError):
                 continue
             self.body_table.recheck_column(c, tol)
+
+        self.range_first_col = fc      # пригодится при обратной записи
+
+    def _on_head_changed(self, row, col):
+        if row != 1:
+            return
+        try:
+            tol = float(self.head_table.item(1, col).text())
+        except (TypeError, ValueError):
+            return
+
+        # пишем в таблицу
+        ods_col = self.range_first_col + col
+        self.sheet[self.TOL_ROW, ods_col].set_value(tol)
+
+        # перекрашиваем столбец
+        self.body_table.recheck_column(col, tol)
+
+    def push_colors_back(self):
+        cache = {}
+        body_start = self.TOL_ROW + 1
+        for gui_r in range(self.body_table.rowCount()):
+            ods_r = body_start + gui_r
+            for gui_c in range(self.body_table.columnCount()):
+                gui_item = self.body_table.item(gui_r, gui_c)
+                hexclr   = qcolor_hex(gui_item.background().color())
+                ods_cell = self.sheet[ods_r, self.range_first_col + gui_c]
+                style_name = ensure_style(self.ods_doc, hexclr, cache)
+                ods_cell.style_name = style_name
+
+    def save_as(self):
+        if not self.sheet:
+            return
+
+        # 1) гарантируем, что все допуски из шапки попали в лист
+        for c in range(self.head_table.columnCount()):
+            try:
+                tol = float(self.head_table.item(1, c).text())
+                self.sheet[self.TOL_ROW, self.range_first_col + c].set_value(tol)
+            except (TypeError, ValueError):
+                pass
+
+        # 2) переносим цвета
+        self.push_colors_back()
+
+        # 3) спрашиваем имя и сохраняем
+        suggested = self.current_path.replace('.ods', '_checked.ods')
+        path, _ = QFileDialog.getSaveFileName(self, 'Сохранить как…', suggested, 'ODS (*.ods)')
+        if path:
+            self.ods_doc.saveas(path)
 
 # ---------- main ---------------------------------------------------------
 if __name__ == '__main__':
