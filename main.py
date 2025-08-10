@@ -67,7 +67,63 @@ def ensure_style(doc, hexclr: str, cache: dict[str, str]) -> str:
     return sname
             
 
+def get_cell_style(cell, ods_doc):
+    """
+    Возвращает dict с параметрами:
+    {
+        'bg': "#RRGGBB" или None,
+        'text_color': "#RRGGBB" или None,
+        'bold': True/False,
+        'italic': True/False,
+        'underline': True/False,
+        'fontsize': число или None,
+        ...
+    }
+    """
+    # ---- 1. Фон (заливка) ----
+    bg = get_bg_hex(cell, ods_doc)
 
+    # ---- 2. Стиль текста ----
+    sname = getattr(cell, "style_name", None)
+    auto = getattr(ods_doc, "automatic_styles", None) or getattr(ods_doc, "automaticstyles", None)
+    styles = getattr(ods_doc, "styles", None) or getattr(ods_doc, "styles_", None)
+    st = None
+    if sname:
+        if auto and hasattr(auto, "get"):
+            st = auto.get(sname)
+        if not st and styles and hasattr(styles, "get"):
+            st = styles.get(sname)
+
+    # pyexcel-ezodf/odfpy: ищем текстовые свойства (font, underline, bold, color и т.д.)
+    txt_props = None
+    if st:
+        for child in getattr(st, "childNodes", []):
+            # Может быть <style:text-properties ...>
+            qname = getattr(child, "qname", None)
+            if qname and qname[1] == "text-properties":
+                txt_props = child
+                break
+
+    result = {'bg': bg, 'text_color': None, 'bold': False, 'italic': False, 'underline': False, 'fontsize': None}
+
+    if txt_props:
+        color = txt_props.getAttribute("fo:color")
+        if color:
+            result['text_color'] = color
+        if txt_props.getAttribute("fo:font-weight") == "bold":
+            result['bold'] = True
+        if txt_props.getAttribute("fo:font-style") == "italic":
+            result['italic'] = True
+        if txt_props.getAttribute("style:text-underline-style") not in (None, "none"):
+            result['underline'] = True
+        size = txt_props.getAttribute("fo:font-size")
+        if size:
+            try:
+                result['fontsize'] = float(size.replace('pt',''))
+            except Exception:
+                result['fontsize'] = size
+
+    return result
 
 # ---------- вспомогалка -------------------------------------------------
 def col2num(col: str) -> int:                 # 'A' -> 0, 'AA' -> 26
@@ -85,18 +141,123 @@ def parse_range(rng: str):
 
 def get_bg_hex(cell, ods_doc):
     """
-    Возвращает строку «#RRGGBB» или None, если у ячейки нет заливки.
+    Возвращает строку «#RRGGBB» или None, если у ячейки нет заливки,
+    учитывая наследование стиля из строки, столбца и таблицы.
     """
-    sname = cell.style_name
+    # 1. Стиль ячейки
+    sname = getattr(cell, "style_name", None)
+    hexclr = _get_style_bg(sname, ods_doc)
+    if hexclr:
+        return hexclr
+
+    # 2. Стиль строки
+    row = getattr(cell, "row", None)
+    if row is not None:
+        try:
+            rowstyle = cell.table.rows[row].style_name
+            hexclr = _get_style_bg(rowstyle, ods_doc)
+            if hexclr:
+                return hexclr
+        except Exception:
+            pass
+
+    # 3. Стиль столбца
+    col = getattr(cell, "column", None)
+    if col is not None:
+        try:
+            colstyle = cell.table.columns[col].style_name
+            hexclr = _get_style_bg(colstyle, ods_doc)
+            if hexclr:
+                return hexclr
+        except Exception:
+            pass
+
+    # 4. Стиль по умолчанию для таблицы (default-cell-style)
+    try:
+        default_style = getattr(cell.table, "default_cell_style_name", None)
+        hexclr = _get_style_bg(default_style, ods_doc)
+        if hexclr:
+            return hexclr
+    except Exception:
+        pass
+
+    return None
+
+def _get_style_bg(sname, ods_doc):
     if not sname:
         return None
-
-    # automatic_styles в приоритете, иначе ищем в styles
-    st = ods_doc.automatic_styles.get(sname) or ods_doc.styles.get(sname)
+    auto = getattr(ods_doc, "automatic_styles", None) or getattr(ods_doc, "automaticstyles", None)
+    styles = getattr(ods_doc, "styles", None) or getattr(ods_doc, "styles_", None)
+    st = None
+    if auto and hasattr(auto, "get"):
+        st = auto.get(sname)
+    if not st and styles and hasattr(styles, "get"):
+        st = styles.get(sname)
     if not st:
         return None
-    return st.properties.get('fo:background-color')          # спецификация ODF 1.1 :contentReference[oaicite:0]{index=0}
+    # Старый ezodf/pyexcel-ezodf: dict-like .properties
+    props = getattr(st, "properties", None)
+    if isinstance(props, dict):
+        return props.get("fo:background-color")
+    # odfpy: getAttribute
+    elif hasattr(st, "getAttribute"):
+        return st.getAttribute("fo:background-color")
+    return None
 
+
+
+def clone_style_with_new_bg(ods_doc, orig_style_name, new_bg, cache):
+    """
+    Клонирует стиль orig_style_name, меняя только цвет фона.
+    Сохраняет шрифты, границы и т.д.
+    """
+    key = (orig_style_name, new_bg)
+    if key in cache:
+        return cache[key]
+
+    # Находим оригинальный стиль
+    auto = getattr(ods_doc, "automatic_styles", None) or getattr(ods_doc, "automaticstyles", None)
+    styles = getattr(ods_doc, "styles", None) or getattr(ods_doc, "styles_", None)
+
+    orig_style = None
+    if orig_style_name:
+        if auto and hasattr(auto, "get"):
+            orig_style = auto.get(str(orig_style_name))
+        if not orig_style and styles and hasattr(styles, "get"):
+            orig_style = styles.get(str(orig_style_name))
+    # Если не нашли оригинал — создаём обычный новый
+    if orig_style is None:
+        style_name = ensure_style(ods_doc, new_bg, cache)
+        cache[key] = style_name
+        return style_name
+
+    # Создаём новый стиль, копируя параметры
+    from odf.style import Style, TableCellProperties
+    new_name = f"{orig_style_name}_bg_{new_bg.lstrip('#')}"
+    new_style = Style(name=new_name, family="table-cell")
+
+    has_props = False
+    for el in orig_style.childNodes:
+        if getattr(el, "qname", (None, None))[1] == "table-cell-properties":
+            has_props = True
+            # Клонируем и меняем только backgroundcolor
+            new_props = TableCellProperties()
+            for attr in el.attributes.keys():
+                if attr == "fo:background-color":
+                    new_props.setAttribute(attr, new_bg)
+                else:
+                    new_props.setAttribute(attr, el.getAttribute(attr))
+            new_style.addElement(new_props)
+        else:
+            # Копируем другие элементы (шрифт, границы и т.д.)
+            new_style.addElement(el.cloneNode(True))
+    # Если оригинал не содержит table-cell-properties, добавим свой
+    if not has_props:
+        new_style.addElement(TableCellProperties(backgroundcolor=new_bg))
+
+    auto.addElement(new_style)
+    cache[key] = new_name
+    return new_name
 
 # ---------- таблица, умеющая подсвечивать -------------------------------
 class ToleranceAwareTable(QTableWidget):
@@ -169,7 +330,7 @@ class ODSViewer(QMainWindow):
         self.btn_save.setEnabled(True)
         self.show_range()                   # сразу отрисовываем
 
-
+    
 
     # -------- отображение диапазона или всей таблицы --------------------
     def show_range(self):
@@ -212,8 +373,40 @@ class ODSViewer(QMainWindow):
         for r in range(n_rows):
             for c in range(n_cols):
                 v = self.sheet[data_start + r, fc + c].value
-                self.body_table.setItem(r, c, QTableWidgetItem(str(v) if v is not None else ''))
+                item = QTableWidgetItem(str(v) if v is not None else '')
+                cell = self.sheet[data_start + r, fc + c]
+                style_info = get_cell_style(cell, self.ods_doc)
+                # Фон
+                if style_info['bg']:
+                    item.setBackground(QColor(style_info['bg']))
+                # Цвет текста
+                if style_info['text_color']:
+                    item.setForeground(QColor(style_info['text_color']))
+                # Жирный
+                if style_info['bold']:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                # Курсив
+                if style_info['italic']:
+                    font = item.font()
+                    font.setItalic(True)
+                    item.setFont(font)
+                # Подчёркнутый
+                if style_info['underline']:
+                    font = item.font()
+                    font.setUnderline(True)
+                    item.setFont(font)
+                # Размер
+                if style_info['fontsize']:
+                    font = item.font()
+                    try:
+                        font.setPointSize(int(float(style_info['fontsize'])))
+                    except Exception:
+                        pass
+                    item.setFont(font)
 
+                self.body_table.setItem(r, c, item)
         # ------ первая глобальная проверка ------------------------------
         for c in range(n_cols):
             try:
@@ -246,10 +439,17 @@ class ODSViewer(QMainWindow):
             ods_r = body_start + gui_r
             for gui_c in range(self.body_table.columnCount()):
                 gui_item = self.body_table.item(gui_r, gui_c)
-                hexclr   = qcolor_hex(gui_item.background().color())
+                if gui_item is None:
+                    continue
+                hexclr = qcolor_hex(gui_item.background().color())
                 ods_cell = self.sheet[ods_r, self.range_first_col + gui_c]
-                style_name = ensure_style(self.ods_doc, hexclr, cache)
-                ods_cell.style_name = style_name
+                prev_hex = get_bg_hex(ods_cell, self.ods_doc)
+                
+                # Только если у ячейки есть style_name и цвет реально менялся
+                if ods_cell.style_name and prev_hex != hexclr:
+                    style_name = clone_style_with_new_bg(self.ods_doc, ods_cell.style_name, hexclr, cache)
+                    ods_cell.style_name = style_name
+    
 
     def save_as(self):
         if not self.sheet:
