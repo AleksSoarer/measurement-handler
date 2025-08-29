@@ -2,3 +2,7 @@ venv/
 data/
 *.pdf
 *.ods
+main0.py
+mainold.py
+maintest.py
+*.png
