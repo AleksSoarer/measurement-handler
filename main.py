@@ -323,7 +323,7 @@ class MiniOdsEditor(QWidget):
         self.oos_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.oos_table.setFrameStyle(QFrame.NoFrame)
         self.oos_table.setShowGrid(False)
-        self.oos_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
+        self.oos_table.setStyleSheet("QTableWidget::item { font-weight: 600; }")
 
 
         # ======= CENTER AREA: left fixed main info + right main =======
