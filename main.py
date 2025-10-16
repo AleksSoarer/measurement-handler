@@ -21,6 +21,104 @@ from PyQt5.QtCore import QRect
 from PyQt5.QtWidgets import QTableView, QListView, QScrollArea
 from pypdf import PdfReader, PdfWriter
 
+# ==== DIAGNOSTICS START =======================================================
+import sys, os, io, traceback, logging, faulthandler, time
+
+# 1) Логгер в файл (перезаписываем каждый запуск)
+logging.basicConfig(
+    filename="debug.log",
+    filemode="w",
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+
+# 2) Безопасный repr, который не вызывает пользовательский __repr__
+def safe_repr(x):
+    try:
+        return repr(x)
+    except Exception:
+        try:
+            return object.__repr__(x)
+        except Exception:
+            return f"<unrepr-able type={type(x)}>"
+
+# 3) Страж для sys.stderr: фиксирует закрытия и проксирует вызовы
+class _StderrGuard(io.TextIOBase):
+    def __init__(self, underlying):
+        self._u = underlying
+    def write(self, s):
+        try:
+            return self._u.write(s)
+        except Exception:
+            # как минимум не упадём
+            return 0
+    def flush(self):
+        try:
+            return self._u.flush()
+        except Exception:
+            return None
+    def close(self):
+        try:
+            logging.error("sys.stderr.close() called!\n%s", "".join(traceback.format_stack(limit=25)))
+        except Exception:
+            pass
+        try:
+            return self._u.close()
+        except Exception:
+            return None
+    def __getattr__(self, name):
+        return getattr(self._u, name)
+
+def _ensure_stderr():
+    # если stderr пропал или закрыт — восстанавливаем
+    try:
+        if not getattr(sys, "stderr", None) or not hasattr(sys.stderr, "write"):
+            sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="ignore")
+        # оборачиваем стражом (один раз)
+        if not isinstance(sys.stderr, _StderrGuard):
+            sys.stderr = _StderrGuard(sys.stderr)
+    except Exception:
+        try:
+            sys.stderr = _StderrGuard(open(os.devnull, "w", encoding="utf-8", errors="ignore"))
+        except Exception:
+            pass
+
+_ensure_stderr()
+try:
+    # faulthandler — в отдельный файл, чтобы не зависеть от stderr
+    _fh = open("errors.log", "a", encoding="utf-8")
+    faulthandler.enable(file=_fh)
+except Exception:
+    pass
+
+# 4) Глобальный перехватчик необработанных исключений → debug.log
+def _excepthook(tp, val, tb):
+    try:
+        logging.error("UNCAUGHT EXCEPTION", exc_info=(tp, val, tb))
+    finally:
+        # и старый хуком тоже дернём на всякий
+        if hasattr(sys, "__excepthook__"):
+            try:
+                sys.__excepthook__(tp, val, tb)
+            except Exception:
+                pass
+sys.excepthook = _excepthook
+
+# 5) Лёгкий счётчик повторных вызовов — поможет вскрыть циклы сигналов
+_last_bucket = [0.0]
+_counts = {}
+def log_reentry(tag, every=50):
+    now = time.monotonic()
+    if now - _last_bucket[0] > 0.25:
+        _counts.clear()
+        _last_bucket[0] = now
+    n = _counts.get(tag, 0) + 1
+    _counts[tag] = n
+    if n % every == 0:
+        logging.warning("%s called %d times within 250ms\n%s",
+                        tag, n, "".join(traceback.format_stack(limit=20)))
+# ==== DIAGNOSTICS END =========================================================
+
 # ---- Colors ----
 GREEN = QColor("#C6EFCE")  # ok data
 RED   = QColor("#FFC7CE")  # bad data
@@ -49,6 +147,7 @@ EXPORT_FONT_PT = 24.0   # меняй одно число: шрифт в сохр
 # ---- UI font size (только виджетам на экране) ----
 UI_FONT_PT = 10.0
 
+_NUM_RE = re.compile(r'^[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][+-]?\d+)?$')
 
 # ---- Helpers ----
 """
@@ -69,16 +168,37 @@ def _fmt_serial(s: str) -> str:
             return str(i)
     return s or ""
 
-def try_parse_float(s: str):
+
+
+def try_parse_float(s):
+    # Допускаем None, числа и строки; всё остальное — не число
     if s is None:
         return None
+    # Если прилетел QTableWidgetItem — берём текст
+    if hasattr(s, "text") and callable(getattr(s, "text", None)):
+        s = s.text()
+    if isinstance(s, (int, float)):
+        return float(s)
+    if not isinstance(s, str):
+        return None
+
     s = s.strip()
     if not s:
         return None
-    candidate = s.replace(',', '.')
+
+    # Быстрые исключения по известным маркерам
+    up = s.upper()
+    if up in ("Y", "N", "NM"):
+        return None
+
+    # Пропускаем только «похожие на число» строки
+    if not _NUM_RE.match(s):
+        return None
+
     try:
-        return float(candidate)
-    except ValueError:
+        return float(s.replace(",", "."))
+    except Exception:
+        # На всякий случай — никакого логирования отсюда
         return None
 
 def _extract_text_from_cell(cell: TableCell) -> str:
@@ -136,6 +256,8 @@ class MiniOdsEditor(QWidget):
         super().__init__()
         self._tol_cache = []
         self._in_cell_style = False
+        self._in_ensure_cols = False
+        self._in_oos_update = False
         self.setWindowTitle("Контроль допусков")
         self.resize(1280, 840)
 
@@ -381,6 +503,8 @@ class MiniOdsEditor(QWidget):
         self.table.horizontalScrollBar().valueChanged.connect(self.oos_table.horizontalScrollBar().setValue)
         # oos_table без собственных полос, но связь в обе стороны не помешает
         self.oos_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+
+
 
     # ---------- UI setup helpers ----------
     def _apply_service_row_visibility(self):
@@ -956,77 +1080,83 @@ class MiniOdsEditor(QWidget):
     # ---------- Panels/Info sync helpers ----------
     
     def _ensure_panel_cols(self):
-        cols = self.table.columnCount()
+        if getattr(self, "_in_ensure_cols", False):
+            return
+        self._in_ensure_cols = True
+        try:
+            cols = self.table.columnCount()
 
-        # center header/tol panels
-        for tw in (self.header_table, self.tolerance_table):
-            if tw.columnCount() != cols:
-                tw.blockSignals(True)
-                tw.setColumnCount(cols)
-                # init cells
-                for r in range(tw.rowCount()):
-                    for c in range(cols):
-                        it = tw.item(r, c)
-                        if it is None:
-                            tw.setItem(r, c, QTableWidgetItem(""))
-                        tw.item(r, c).setTextAlignment(Qt.AlignCenter)
-                tw.blockSignals(False)
-            # widths
-            for c in range(cols):
-                tw.setColumnWidth(c, self.table.columnWidth(c))
-            # hide col0 – его отображают left-виджеты
-            if cols > 0:
-                tw.setColumnHidden(0, True)
+            # center header/tol panels
+            for tw in (self.header_table, self.tolerance_table):
+                if tw.columnCount() != cols:
+                    tw.blockSignals(True)
+                    tw.setColumnCount(cols)
+                    # init cells
+                    for r in range(tw.rowCount()):
+                        for c in range(cols):
+                            it = tw.item(r, c)
+                            if it is None:
+                                tw.setItem(r, c, QTableWidgetItem(""))
+                            tw.item(r, c).setTextAlignment(Qt.AlignCenter)
+                    tw.blockSignals(False)
+                # widths
+                for c in range(cols):
+                    tw.setColumnWidth(c, self.table.columnWidth(c))
+                # hide col0 – его отображают left-виджеты
+                if cols > 0:
+                    tw.setColumnHidden(0, True)
 
-        # left main info rows = точно как в main
-        rows = self.table.rowCount()
-        if self.info_main_table.rowCount() != rows:
-            self.info_main_table.blockSignals(True)
-            self.info_main_table.setRowCount(rows)
+            # left main info rows = точно как в main
+            rows = self.table.rowCount()
+            if self.info_main_table.rowCount() != rows:
+                self.info_main_table.blockSignals(True)
+                self.info_main_table.setRowCount(rows)
+                for r in range(rows):
+                    it = self.info_main_table.item(r, 0)
+                    if it is None:
+                        self.info_main_table.setItem(r, 0, QTableWidgetItem(""))
+                    self.info_main_table.item(r, 0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                self.info_main_table.blockSignals(False)
+            # высоты строк и скрытие 1,2,5 для точного совпадения
             for r in range(rows):
-                it = self.info_main_table.item(r, 0)
-                if it is None:
-                    self.info_main_table.setItem(r, 0, QTableWidgetItem(""))
-                self.info_main_table.item(r, 0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            self.info_main_table.blockSignals(False)
-        # высоты строк и скрытие 1,2,5 для точного совпадения
-        for r in range(rows):
-            self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
-        #for r in HEADER_ROWS + [TOL_ROW]:
-        #    if r < rows:
-        #        self.info_main_table.setRowHidden(r, True)
+                self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
+            #for r in HEADER_ROWS + [TOL_ROW]:
+            #    if r < rows:
+            #        self.info_main_table.setRowHidden(r, True)
 
-        # высоты строк
-        for r in range(rows):
-            self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
-        # скрываем все служебные (0..FIRST_DATA_ROW-1)
-        for r in range(min(rows, FIRST_DATA_ROW)):
-            self.info_main_table.setRowHidden(r, True)
-        
-        # left header & tol fixed tables – ширина колонки уже задана, высоты держим = панелям
-        # ничего дополнительно делать не нужно здесь
-        self._sync_order_row()
+            # высоты строк
+            for r in range(rows):
+                self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
+            # скрываем все служебные (0..FIRST_DATA_ROW-1)
+            for r in range(min(rows, FIRST_DATA_ROW)):
+                self.info_main_table.setRowHidden(r, True)
+            
+            # left header & tol fixed tables – ширина колонки уже задана, высоты держим = панелям
+            # ничего дополнительно делать не нужно здесь
+            self._sync_order_row()
 
-        # --- синхронизировать нижнюю полосу (oos_table) с main
-        cols = self.table.columnCount()
-        if self.oos_table.columnCount() != cols:
-            self.oos_table.blockSignals(True)
-            self.oos_table.setColumnCount(cols)
+            # --- синхронизировать нижнюю полосу (oos_table) с main
+            cols = self.table.columnCount()
+            if self.oos_table.columnCount() != cols:
+                self.oos_table.blockSignals(True)
+                self.oos_table.setColumnCount(cols)
+                for c in range(cols):
+                    it = self.oos_table.item(0, c)
+                    if it is None:
+                        it = QTableWidgetItem("")
+                        self.oos_table.setItem(0, c, it)
+                    self.oos_table.item(0, c).setTextAlignment(Qt.AlignCenter)
+                self.oos_table.blockSignals(False)
+
+            # ширины колонок = как у main
             for c in range(cols):
-                it = self.oos_table.item(0, c)
-                if it is None:
-                    it = QTableWidgetItem("")
-                    self.oos_table.setItem(0, c, it)
-                self.oos_table.item(0, c).setTextAlignment(Qt.AlignCenter)
-            self.oos_table.blockSignals(False)
+                self.oos_table.setColumnWidth(c, self.table.columnWidth(c))
 
-        # ширины колонок = как у main
-        for c in range(cols):
-            self.oos_table.setColumnWidth(c, self.table.columnWidth(c))
-
-        # скрываем 0-й столбец (описательный)
-        if cols > 0:
-            self.oos_table.setColumnHidden(0, True)
+            # скрываем 0-й столбец (описательный)
+            if cols > 0:
+                self.oos_table.setColumnHidden(0, True)
+        finally:
+            self._in_ensure_cols = False
 
     def _sync_header_from_main(self):
         self.header_table.blockSignals(True)
@@ -1353,47 +1483,47 @@ class MiniOdsEditor(QWidget):
 
     # не в допуске 
     def _recompute_oos_counts(self):
-        """Посчитать количество ЧИСЕЛ вне допуска по каждому столбцу (c >= 1)."""
-        cols = self.table.columnCount()
-        rows = self.table.rowCount()
-        if cols == 0 or rows == 0:
+        if getattr(self, "_in_oos_update", False):
             return
+        self._in_oos_update = True
+        try:
+            cols = self.table.columnCount()
+            rows = self.table.rowCount()
+            if cols == 0 or rows == 0:
+                return
 
-        # гарантируем структуру/ширины нижней полосы
-        self._ensure_panel_cols()
+            # НИЧЕГО структурно не меняем: ни кол-во столбцов/строк, ни ширины.
+            self.oos_table.blockSignals(True)
+            for c in range(cols):
+                if c == 0:
+                    cell = self.oos_table.item(0, c) or QTableWidgetItem("")
+                    if self.oos_table.item(0, c) is None:
+                        self.oos_table.setItem(0, c, cell)
+                    cell.setText("")
+                    cell.setBackground(WHITE)
+                    continue
 
-        self.oos_table.blockSignals(True)
-        for c in range(cols):
-            if c == 0:
-                # описательный столбец — пусто
-                cell = self.oos_table.item(0, c)
-                if cell is None:
-                    cell = QTableWidgetItem("")
+                tol = self._get_tol(c)
+                cnt = 0
+                if tol is not None:
+                    for r in range(FIRST_DATA_ROW, rows):
+                        it = self.table.item(r, c)
+                        if not it:
+                            continue
+                        f = try_parse_float(it.text())
+                        if f is None:
+                            continue
+                        if abs(f) > tol:
+                            cnt += 1
+
+                cell = self.oos_table.item(0, c) or QTableWidgetItem("")
+                if self.oos_table.item(0, c) is None:
                     self.oos_table.setItem(0, c, cell)
-                cell.setText("")
+                cell.setText(str(cnt))
                 cell.setBackground(WHITE)
-                continue
-
-            tol = self._get_tol(c)
-            cnt = 0
-            if tol is not None:
-                for r in range(FIRST_DATA_ROW, rows):
-                    it = self.table.item(r, c)
-                    if not it:
-                        continue
-                    f = try_parse_float(it.text())
-                    if f is None:
-                        continue  # считаем ТОЛЬКО числа
-                    if abs(f) > tol:
-                        cnt += 1
-
-            cell = self.oos_table.item(0, c)
-            if cell is None:
-                cell = QTableWidgetItem("")
-                self.oos_table.setItem(0, c, cell)
-            cell.setText(str(cnt) if c > 0 else "")
-            cell.setBackground(WHITE)
-        self.oos_table.blockSignals(False)
+        finally:
+            self.oos_table.blockSignals(False)
+            self._in_oos_update = False
 
     # ---------- ODS I/O ----------
     def save_to_ods(self):
@@ -1413,17 +1543,17 @@ class MiniOdsEditor(QWidget):
             return TextProperties(fontsize=f"{EXPORT_FONT_PT}pt")
 
         style_green = Style(name="cellGreen", family="table-cell")
-        style_green.addElement(TableCellProperties(backgroundcolor="#1A8830"))
+        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
         style_green.addElement(_txt_props())
         doc.automaticstyles.addElement(style_green)
 
         style_red = Style(name="cellRed", family="table-cell")
-        style_red.addElement(TableCellProperties(backgroundcolor="#8D1926"))
+        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
         style_red.addElement(_txt_props())
         doc.automaticstyles.addElement(style_red)
 
         style_blue = Style(name="cellBlue", family="table-cell")
-        style_blue.addElement(TableCellProperties(backgroundcolor="#265C8F"))
+        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
         style_blue.addElement(_txt_props())
         doc.automaticstyles.addElement(style_blue)
 
