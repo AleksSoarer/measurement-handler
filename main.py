@@ -15,18 +15,18 @@ from odf.table import Table, TableRow, TableCell
 from odf.text import P
 
 # ---- Colors ----
-GREEN = QColor("#C6EFCE")   # soft green
-RED   = QColor("#FFC7CE")   # soft red
-BLUE  = QColor("#9DC3E6")   # kept for backward compat
+GREEN = QColor("#1A8830")   # soft green
+RED   = QColor("#8D1926")   # soft red
+BLUE  = QColor("#265C8F")   # kept for backward compat (открытие старых .ods)
 WHITE = QColor("#FFFFFF")
 
 # ---- Layout sizes ----
-HDR_PANEL_HEIGHT = 60
-TOL_PANEL_HEIGHT = 56
-INFO_COL_WIDTH   = 220  # ширина левого фиксированного столбца
+HDR_PANEL_HEIGHT = 140
+TOL_PANEL_HEIGHT = 70
+INFO_COL_WIDTH   = 200  # ширина левого фиксированного столбца
 
 # ---- Special rows (0-based in MAIN table) ----
-HEADER_ROWS    = [1, 2]  # «шапка», которую показываем сверху в отдельном виджете
+HEADER_ROWS    = [3, 4]  # «шапка», показываем сверху в отдельном виджете
 NOMINAL_ROW    = 4       # 5-я строка: номинал (информативно)
 TOL_ROW        = 5       # 6-я строка: допуск (редактируется в панели)
 FIRST_DATA_ROW = 6       # данные с 7-й строки
@@ -100,23 +100,24 @@ def _sheet_content_bounds(sheet: Table):
 class MiniOdsEditor(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Мини-редактор ODS (фикс. шапка + допуски + фикс. 1-й столбец)")
-        self.resize(1250, 820)
+        self.setWindowTitle("Контроль допусков")
+        self.resize(1280, 840)
 
         root = QVBoxLayout(self)
 
         # --- Controls ---
         ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("Колонки (X):"))
+        
+        #ctrl.addWidget(QLabel("Колонки (X):"))
         self.sb_cols = QSpinBox(); self.sb_cols.setRange(1, 2000); self.sb_cols.setValue(8)
-        ctrl.addWidget(self.sb_cols)
+        #ctrl.addWidget(self.sb_cols)
 
-        ctrl.addWidget(QLabel("Строки (Y):"))
+        #ctrl.addWidget(QLabel("Строки (Y):"))
         self.sb_rows = QSpinBox(); self.sb_rows.setRange(1, 5000); self.sb_rows.setValue(12)
-        ctrl.addWidget(self.sb_rows)
+        #ctrl.addWidget(self.sb_rows)
 
-        self.btn_build = QPushButton("Создать таблицу"); self.btn_build.clicked.connect(self.build_table)
-        ctrl.addWidget(self.btn_build)
+        #self.btn_build = QPushButton("Создать таблицу"); self.btn_build.clicked.connect(self.build_table)
+        #ctrl.addWidget(self.btn_build)
 
         self.btn_open = QPushButton("Открыть .ods"); self.btn_open.clicked.connect(self.open_ods)
         ctrl.addWidget(self.btn_open)
@@ -127,93 +128,172 @@ class MiniOdsEditor(QWidget):
         ctrl.addStretch()
         root.addLayout(ctrl)
 
-        # ======= TOP PANELS (stacked vertically) =======
-        # HEADER panel (rows 1–2)
+        # ======= TOP PANELS =======
+        # left fixed header info (rows 1–2 of col0)
+        self.info_header_table = QTableWidget(len(HEADER_ROWS), 1, self)
+        self._setup_left_fixed_table(self.info_header_table, HDR_PANEL_HEIGHT)
+
+        # center header (rows 1–2, all columns)
         self.header_table = QTableWidget(len(HEADER_ROWS), 0, self)
         self._setup_top_table(self.header_table, HDR_PANEL_HEIGHT, font_inc=1.5)
         self.header_table.cellChanged.connect(self.on_hdr_cell_changed)
 
-        # TOLERANCE panel (row 5)
+        # left fixed tolerance info (row 5 of col0)
+        self.info_tol_table = QTableWidget(1, 1, self)
+        self._setup_left_fixed_table(self.info_tol_table, TOL_PANEL_HEIGHT)
+
+        # center tolerance (row 5, all columns)
         self.tolerance_table = QTableWidget(1, 0, self)
         self._setup_top_table(self.tolerance_table, TOL_PANEL_HEIGHT, font_inc=2.0)
         self.tolerance_table.cellChanged.connect(self.on_tol_cell_changed)
 
-        # ======= CENTER AREA: left fixed column + right main stack =======
+        # ======= CENTER AREA: left fixed main info + right main =======
         center = QHBoxLayout()
         root.addLayout(center, stretch=1)
 
-        # LEFT fixed column (row info)
-        self.info_table = QTableWidget(0, 1, self)
-        self._setup_info_table()
+        # left main info (col0 for all rows, except hidden 1,2,5 — мы их тоже скрываем здесь)
+        self.info_main_table = QTableWidget(0, 1, self)
+        self._setup_left_main_table(self.info_main_table)
+
+        # Заголовок для левого фикс-столбца (залипает) — СОЗДАЁМ ДО добавления в layout
+        self.info_main_caption = QTableWidget(1, 1, self)
+        self.info_main_caption.verticalHeader().setVisible(False)
+        self.info_main_caption.horizontalHeader().setVisible(False)
+        self.info_main_caption.setFixedHeight(32)
+        self.info_main_caption.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.info_main_caption.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_main_caption.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_main_caption.setColumnWidth(0, INFO_COL_WIDTH)  # ширина сразу здесь
+        cap_item = QTableWidgetItem("Серийный номер")
+        cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.info_main_caption.setItem(0, 0, cap_item)
+        self.info_main_caption.setStyleSheet(
+            "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
+        )
 
         # RIGHT side: vertical stack of header + tolerance + main
         right_stack = QVBoxLayout()
+        # Для левой части создаём такую же «стек»-колонку
+        left_stack = QVBoxLayout()
 
-        # add widgets
+        # LEFT stack widgets
+        left_stack.addWidget(self.info_header_table)
+        left_sep1 = QFrame(); left_sep1.setFrameShape(QFrame.HLine); left_sep1.setFrameShadow(QFrame.Sunken)
+        left_stack.addWidget(left_sep1)
+        left_stack.addWidget(self.info_tol_table)
+        left_sep2 = QFrame(); left_sep2.setFrameShape(QFrame.HLine); left_sep2.setFrameShadow(QFrame.Sunken)
+        left_stack.addWidget(left_sep2)
+        left_stack.addWidget(self.info_main_caption)   # <— заголовок над таблицей
+        left_stack.addWidget(self.info_main_table)     # <— сама таблица
+
+
+        # RIGHT stack widgets
         right_stack.addWidget(self.header_table)
+        right_sep1 = QFrame(); right_sep1.setFrameShape(QFrame.HLine); right_sep1.setFrameShadow(QFrame.Sunken)
+        right_stack.addWidget(right_sep1)
         right_stack.addWidget(self.tolerance_table)
+        right_sep2 = QFrame(); right_sep2.setFrameShape(QFrame.HLine); right_sep2.setFrameShadow(QFrame.Sunken)
+        right_stack.addWidget(right_sep2)
 
         # MAIN table
         self.table = QTableWidget(0, 0, self)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.verticalHeader().setVisible(False)
         self.table.cellChanged.connect(self.on_cell_changed)
         right_stack.addWidget(self.table)
 
         # put into center
-        center.addWidget(self.info_table)
-        # thin separator
+        left_container = QWidget(); left_container.setLayout(left_stack)
+        right_container = QWidget(); right_container.setLayout(right_stack)
+        center.addWidget(left_container)
+        # thin vertical separator
         sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
         center.addWidget(sep)
-        container = QWidget(); container.setLayout(right_stack)
-        center.addWidget(container, stretch=1)
+        center.addWidget(right_container, stretch=1)
 
         # --- Sync scrollbars & sizes ---
-        # Horizontal: sync header/tolerance with main
+        # Horizontal: sync center header/tolerance with main
         self.table.horizontalScrollBar().valueChanged.connect(self.header_table.horizontalScrollBar().setValue)
         self.table.horizontalScrollBar().valueChanged.connect(self.tolerance_table.horizontalScrollBar().setValue)
         self.header_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
         self.tolerance_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
-        # Vertical: sync info column with main
-        self.table.verticalScrollBar().valueChanged.connect(self.info_table.verticalScrollBar().setValue)
-        self.info_table.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
-        # Column width sync (panels)
+        # Vertical: sync left main info with main
+        self.table.verticalScrollBar().valueChanged.connect(self.info_main_table.verticalScrollBar().setValue)
+        self.info_main_table.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
+
+        # Подстраиваем значения при смене диапазона (чтобы не «уплывал» offset)
+        self.table.verticalScrollBar().rangeChanged.connect(
+            lambda _min, _max: self.info_main_table.verticalScrollBar().setValue(
+                self.table.verticalScrollBar().value()
+            )
+        )
+        self.info_main_table.verticalScrollBar().rangeChanged.connect(
+            lambda _min, _max: self.table.verticalScrollBar().setValue(
+                self.info_main_table.verticalScrollBar().value()
+            )
+        )
+        # Column width sync (center panels)
         self.table.horizontalHeader().sectionResized.connect(self._on_main_section_resized)
-        # Row height sync (left info <-> main)
+        # Row height sync (left main info <-> main)
         self.table.verticalHeader().sectionResized.connect(self._on_main_row_height_changed)
+
+        # Edits in left fixed tables should update main col0
+        self.info_header_table.cellChanged.connect(self.on_info_header_cell_changed)
+        self.info_tol_table.cellChanged.connect(self.on_info_tol_cell_changed)
+        self.info_main_table.cellChanged.connect(self.on_info_main_cell_changed)
 
         # Init
         self.build_table()
 
     # ---------- UI setup helpers ----------
+    def _apply_service_row_visibility(self):
+        """Спрятать все служебные строки (до FIRST_DATA_ROW) из нижних таблиц."""
+        rows = self.table.rowCount()
+        # в правой main-таблице
+        for r in range(min(rows, FIRST_DATA_ROW)):
+            self.table.setRowHidden(r, True)
+        # в левой info_main — чтобы выравнивание не «плыло»
+        for r in range(min(rows, FIRST_DATA_ROW)):
+            if r < self.info_main_table.rowCount():
+                self.info_main_table.setRowHidden(r, True)
+
     def _setup_top_table(self, tw: QTableWidget, height: int, font_inc: float = 0.0):
         tw.verticalHeader().setVisible(False)
         tw.horizontalHeader().setVisible(False)
         tw.setFixedHeight(height)
-        # set reasonable row heights
         rows = max(1, tw.rowCount())
         for r in range(rows):
             tw.setRowHeight(r, max(28, height // rows - 2))
-        # font & padding
-        f = tw.font()
-        f.setPointSizeF(f.pointSizeF() + font_inc)
-        tw.setFont(f)
+        f = tw.font(); f.setPointSizeF(f.pointSizeF() + font_inc); tw.setFont(f)
         tw.setStyleSheet("QTableWidget::item { padding: 6px; }")
-        # edits & scroll
         tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
         tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         tw.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
 
-    def _setup_info_table(self):
-        self.info_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.info_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.info_table.verticalHeader().setVisible(False)
-        self.info_table.horizontalHeader().setVisible(False)
-        self.info_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        self.info_table.setColumnWidth(0, INFO_COL_WIDTH)
-        self.info_table.cellChanged.connect(self.on_info_cell_changed)
-        # белый фон всегда
-        self.info_table.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
+    def _setup_left_fixed_table(self, tw: QTableWidget, height: int):
+        tw.setColumnCount(1)
+        tw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tw.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        tw.verticalHeader().setVisible(False)
+        tw.horizontalHeader().setVisible(False)
+        tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        tw.setFixedHeight(height)
+        for r in range(tw.rowCount()):
+            tw.setRowHeight(r, max(28, height // max(1, tw.rowCount()) - 2))
+        tw.setColumnWidth(0, INFO_COL_WIDTH)
+        tw.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
+
+    def _setup_left_main_table(self, tw: QTableWidget):
+        tw.setColumnCount(1)
+        tw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tw.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        tw.verticalHeader().setVisible(False)
+        tw.horizontalHeader().setVisible(False)
+        tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        tw.setColumnWidth(0, INFO_COL_WIDTH)
+        tw.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
 
     # ---------- Coloring rules ----------
     def _get_tol(self, col):
@@ -234,11 +314,11 @@ class MiniOdsEditor(QWidget):
         text = text_raw.strip()
         up = text.upper()
 
-        # колонки 0 в MAIN скрыта и служит источником для info_table — держим белым
+        # колонки 0 в MAIN скрыта и служит источником для left info — держим белым
         if col == 0:
             it.setBackground(WHITE); return
 
-        # строки шапки/номинал/допуск — не красим
+        # служебные строки — не красим
         if row in HEADER_ROWS or row in (NOMINAL_ROW, TOL_ROW):
             it.setBackground(WHITE); return
 
@@ -286,90 +366,149 @@ class MiniOdsEditor(QWidget):
         finally:
             self.table.blockSignals(False)
 
-    # ---------- Top panels sync ----------
-    def _ensure_hdr_panel_cols(self):
+    # ---------- Panels/Info sync helpers ----------
+    
+    def _ensure_panel_cols(self):
         cols = self.table.columnCount()
-        if self.header_table.columnCount() != cols:
-            self.header_table.blockSignals(True)
-            self.header_table.setColumnCount(cols)
-            for r in range(self.header_table.rowCount()):
-                for c in range(cols):
-                    it = self.header_table.item(r, c)
-                    if it is None:
-                        self.header_table.setItem(r, c, QTableWidgetItem(""))
-                    self.header_table.item(r, c).setTextAlignment(Qt.AlignCenter)
-            self.header_table.blockSignals(False)
-        # ширины (скрытый 0-й тоже синхронизируется, но мы его спрячем)
-        for c in range(cols):
-            self.header_table.setColumnWidth(c, self.table.columnWidth(c))
-        # прячем 0-й столбец у панелей (его отображает info_table)
-        self.header_table.setColumnHidden(0, True)
 
-    def _sync_hdr_from_main(self):
-        self._ensure_hdr_panel_cols()
-        try:
-            self.header_table.blockSignals(True)
-            cols = self.table.columnCount()
-            for i, r_main in enumerate(HEADER_ROWS):
-                for c in range(cols):
-                    src = self.table.item(r_main, c)
-                    txt = src.text() if src else ""
-                    it = self.header_table.item(i, c)
-                    if it is None:
-                        it = QTableWidgetItem("")
-                        self.header_table.setItem(i, c, it)
-                    it.setTextAlignment(Qt.AlignCenter)
-                    it.setText(txt)
-                    it.setBackground(WHITE)
-        finally:
-            self.header_table.blockSignals(False)
+        # center header/tol panels
+        for tw in (self.header_table, self.tolerance_table):
+            if tw.columnCount() != cols:
+                tw.blockSignals(True)
+                tw.setColumnCount(cols)
+                # init cells
+                for r in range(tw.rowCount()):
+                    for c in range(cols):
+                        it = tw.item(r, c)
+                        if it is None:
+                            tw.setItem(r, c, QTableWidgetItem(""))
+                        tw.item(r, c).setTextAlignment(Qt.AlignCenter)
+                tw.blockSignals(False)
+            # widths
+            for c in range(cols):
+                tw.setColumnWidth(c, self.table.columnWidth(c))
+            # hide col0 – его отображают left-виджеты
+            if cols > 0:
+                tw.setColumnHidden(0, True)
 
+        # left main info rows = точно как в main
+        rows = self.table.rowCount()
+        if self.info_main_table.rowCount() != rows:
+            self.info_main_table.blockSignals(True)
+            self.info_main_table.setRowCount(rows)
+            for r in range(rows):
+                it = self.info_main_table.item(r, 0)
+                if it is None:
+                    self.info_main_table.setItem(r, 0, QTableWidgetItem(""))
+                self.info_main_table.item(r, 0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            self.info_main_table.blockSignals(False)
+        # высоты строк и скрытие 1,2,5 для точного совпадения
+        for r in range(rows):
+            self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
+        for r in HEADER_ROWS + [TOL_ROW]:
+            if r < rows:
+                self.info_main_table.setRowHidden(r, True)
+
+        # left header & tol fixed tables – ширина колонки уже задана, высоты держим = панелям
+        # ничего дополнительно делать не нужно здесь
+
+    def _sync_header_from_main(self):
+        self.header_table.blockSignals(True)
+        cols = self.table.columnCount()
+        for i, r_main in enumerate(HEADER_ROWS):
+            for c in range(cols):
+                src = self.table.item(r_main, c)
+                txt = src.text() if src else ""
+                it = self.header_table.item(i, c)
+                if it is None:
+                    it = QTableWidgetItem(""); self.header_table.setItem(i, c, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt); it.setBackground(WHITE)
+        self.header_table.blockSignals(False)
+
+        # left header info (col0)
+        self.info_header_table.blockSignals(True)
+        for i, r_main in enumerate(HEADER_ROWS):
+            src = self.table.item(r_main, 0)
+            txt = src.text() if src else ""
+            it = self.info_header_table.item(i, 0)
+            if it is None:
+                it = QTableWidgetItem(""); self.info_header_table.setItem(i, 0, it)
+            it.setText(txt)
+        self.info_header_table.blockSignals(False)
+    
     def on_hdr_cell_changed(self, row, col):
-        if col < 0 or row < 0:
+        """
+        Редактирование ячеек верхней шапки (header_table).
+        Прокидываем текст в скрытые строки основной таблицы (HEADER_ROWS)
+        и не запускаем перекраску (эти строки всегда белые).
+        """
+        if row < 0 or col < 0:
             return
+
         main_row = HEADER_ROWS[row]
-        txt = self.header_table.item(row, col).text() if self.header_table.item(row, col) else ""
+
+        src_item = self.header_table.item(row, col)
+        txt = src_item.text() if src_item else ""
+
         it = self.table.item(main_row, col)
         if it is None:
-            it = QTableWidgetItem(""); self.table.setItem(main_row, col, it)
+            it = QTableWidgetItem("")
+            self.table.setItem(main_row, col, it)
+
         try:
             self.table.blockSignals(True)
-            it.setText(txt); it.setBackground(WHITE)
+            it.setText(txt)
+            it.setBackground(WHITE)  # служебные строки не красим
         finally:
             self.table.blockSignals(False)
-        # не перекрашиваем — эти строки не красятся
 
-    def _ensure_tol_panel_cols(self):
-        cols = self.table.columnCount()
-        if self.tolerance_table.columnCount() != cols:
-            self.tolerance_table.blockSignals(True)
-            self.tolerance_table.setColumnCount(cols)
-            for c in range(cols):
-                it = self.tolerance_table.item(0, c)
-                if it is None:
-                    self.tolerance_table.setItem(0, c, QTableWidgetItem(""))
-                self.tolerance_table.item(0, c).setTextAlignment(Qt.AlignCenter)
-            self.tolerance_table.blockSignals(False)
-        for c in range(cols):
-            self.tolerance_table.setColumnWidth(c, self.table.columnWidth(c))
-        self.tolerance_table.setColumnHidden(0, True)
+        # Если редактировали 0-й столбец шапки — обновим левую фикс-таблицу для шапки
+        if col == 0 and row < self.info_header_table.rowCount():
+            try:
+                self.info_header_table.blockSignals(True)
+                left_it = self.info_header_table.item(row, 0)
+                if left_it is None:
+                    left_it = QTableWidgetItem("")
+                    self.info_header_table.setItem(row, 0, left_it)
+                left_it.setText(txt)
+            finally:
+                self.info_header_table.blockSignals(False)
 
     def _sync_tol_from_main(self):
-        self._ensure_tol_panel_cols()
-        try:
-            self.tolerance_table.blockSignals(True)
-            cols = self.table.columnCount()
-            for c in range(cols):
-                src = self.table.item(TOL_ROW, c)
-                txt = src.text() if src else ""
-                it = self.tolerance_table.item(0, c)
-                if it is None:
-                    it = QTableWidgetItem(""); self.tolerance_table.setItem(0, c, it)
-                it.setTextAlignment(Qt.AlignCenter)
-                it.setText(txt)
-                it.setBackground(WHITE)
-        finally:
-            self.tolerance_table.blockSignals(False)
+        self.tolerance_table.blockSignals(True)
+        cols = self.table.columnCount()
+        for c in range(cols):
+            src = self.table.item(TOL_ROW, c)
+            txt = src.text() if src else ""
+            it = self.tolerance_table.item(0, c)
+            if it is None:
+                it = QTableWidgetItem(""); self.tolerance_table.setItem(0, c, it)
+            it.setTextAlignment(Qt.AlignCenter)
+            it.setText(txt); it.setBackground(WHITE)
+        self.tolerance_table.blockSignals(False)
+
+        # left tol info (col0)
+        self.info_tol_table.blockSignals(True)
+        src = self.table.item(TOL_ROW, 0)
+        txt = src.text() if src else ""
+        it = self.info_tol_table.item(0, 0)
+        if it is None:
+            it = QTableWidgetItem(""); self.info_tol_table.setItem(0, 0, it)
+        it.setText(txt)
+        self.info_tol_table.blockSignals(False)
+
+    def _sync_info_main_from_main(self):
+        self.info_main_table.blockSignals(True)
+        rows = self.table.rowCount()
+        for r in range(rows):
+            src = self.table.item(r, 0)
+            txt = src.text() if src else ""
+            it = self.info_main_table.item(r, 0)
+            if it is None:
+                it = QTableWidgetItem(""); self.info_main_table.setItem(r, 0, it)
+            it.setText(txt)
+        self.info_main_table.blockSignals(False)
 
     def _on_main_section_resized(self, logicalIndex, oldSize, newSize):
         if logicalIndex < self.tolerance_table.columnCount():
@@ -377,44 +516,35 @@ class MiniOdsEditor(QWidget):
         if logicalIndex < self.header_table.columnCount():
             self.header_table.setColumnWidth(logicalIndex, newSize)
 
-    # ---------- Left info column sync ----------
-    def _ensure_info_rows(self):
-        rows = self.table.rowCount()
-        if self.info_table.rowCount() != rows:
-            self.info_table.blockSignals(True)
-            self.info_table.setRowCount(rows)
-            for r in range(rows):
-                it = self.info_table.item(r, 0)
-                if it is None:
-                    self.info_table.setItem(r, 0, QTableWidgetItem(""))
-                self.info_table.item(r, 0).setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                # выровняем высоту
-                self.info_table.setRowHeight(r, self.table.rowHeight(r))
-            self.info_table.blockSignals(False)
-
-    def _sync_info_from_main(self):
-        self._ensure_info_rows()
-        try:
-            self.info_table.blockSignals(True)
-            rows = self.table.rowCount()
-            for r in range(rows):
-                src = self.table.item(r, 0)
-                txt = src.text() if src else ""
-                it = self.info_table.item(r, 0)
-                if it is None:
-                    it = QTableWidgetItem(""); self.info_table.setItem(r, 0, it)
-                it.setText(txt)
-                it.setBackground(WHITE)
-        finally:
-            self.info_table.blockSignals(False)
-
     def _on_main_row_height_changed(self, logicalIndex, oldSize, newSize):
-        if 0 <= logicalIndex < self.info_table.rowCount():
-            self.info_table.setRowHeight(logicalIndex, newSize)
+        if 0 <= logicalIndex < self.info_main_table.rowCount():
+            self.info_main_table.setRowHeight(logicalIndex, newSize)
 
-    def on_info_cell_changed(self, row, col):
-        # проброс текста в скрытую колонку 0 основной таблицы
-        txt = self.info_table.item(row, col).text() if self.info_table.item(row, col) else ""
+    def on_info_header_cell_changed(self, row, col):
+        main_row = HEADER_ROWS[row]
+        txt = self.info_header_table.item(row, col).text() if self.info_header_table.item(row, col) else ""
+        it = self.table.item(main_row, 0)
+        if it is None:
+            it = QTableWidgetItem(""); self.table.setItem(main_row, 0, it)
+        try:
+            self.table.blockSignals(True)
+            it.setText(txt); it.setBackground(WHITE)
+        finally:
+            self.table.blockSignals(False)
+
+    def on_info_tol_cell_changed(self, row, col):
+        txt = self.info_tol_table.item(row, col).text() if self.info_tol_table.item(row, col) else ""
+        it = self.table.item(TOL_ROW, 0)
+        if it is None:
+            it = QTableWidgetItem(""); self.table.setItem(TOL_ROW, 0, it)
+        try:
+            self.table.blockSignals(True)
+            it.setText(txt); it.setBackground(WHITE)
+        finally:
+            self.table.blockSignals(False)
+
+    def on_info_main_cell_changed(self, row, col):
+        txt = self.info_main_table.item(row, col).text() if self.info_main_table.item(row, col) else ""
         it = self.table.item(row, 0)
         if it is None:
             it = QTableWidgetItem(""); self.table.setItem(row, 0, it)
@@ -423,7 +553,6 @@ class MiniOdsEditor(QWidget):
             it.setText(txt); it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
-        # не нужно перекрашивать — это инфо-колонка
 
     # ---------- UI callbacks ----------
     def build_table(self):
@@ -443,23 +572,25 @@ class MiniOdsEditor(QWidget):
                     it.setTextAlignment(Qt.AlignCenter)
                     it.setBackground(WHITE)
 
-            # скрываем служебные строки в main (их показывают панели)
+            # скрываем служебные строки в main (их показывают верхние панели)
+            """
             for r in HEADER_ROWS:
                 if r < rows:
                     self.table.setRowHidden(r, True)
             if rows > TOL_ROW:
                 self.table.setRowHidden(TOL_ROW, True)
 
-            # скрываем колонку 0 в main — её показывает info_table
+            # скрываем колонку 0 в main — её показывают левые таблицы
             if cols > 0:
                 self.table.setColumnHidden(0, True)
+            """
+            self._apply_service_row_visibility()
 
-            # синхронизируем панели
-            self._ensure_hdr_panel_cols(); self._sync_hdr_from_main()
-            self._ensure_tol_panel_cols(); self._sync_tol_from_main()
-
-            # левую колонку заполняем и выравниваем по высоте
-            self._sync_info_from_main()
+            # выровнять панели/левые таблицы и залить данными
+            self._ensure_panel_cols()
+            self._sync_header_from_main()
+            self._sync_tol_from_main()
+            self._sync_info_main_from_main()
 
         finally:
             self.table.blockSignals(False)
@@ -475,50 +606,21 @@ class MiniOdsEditor(QWidget):
             it.setText(txt); it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
+        self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
         self.recheck_column(col)
 
     def on_cell_changed(self, row, col):
-        # если изменили скрытые строки в main — синхронизируем панели
+        # отражаем возможные изменения скрытых строк в панели/левых таблицах
         if row in HEADER_ROWS:
-            try:
-                self.header_table.blockSignals(True)
-                idx = HEADER_ROWS.index(row)
-                src = self.table.item(row, col)
-                txt = src.text() if src else ""
-                it = self.header_table.item(idx, col)
-                if it is None:
-                    it = QTableWidgetItem(""); self.header_table.setItem(idx, col, it)
-                it.setTextAlignment(Qt.AlignCenter); it.setText(txt); it.setBackground(WHITE)
-            finally:
-                self.header_table.blockSignals(False)
+            self._sync_header_from_main()
             return
-
         if row == TOL_ROW:
-            try:
-                self.tolerance_table.blockSignals(True)
-                src = self.table.item(TOL_ROW, col)
-                txt = src.text() if src else ""
-                it = self.tolerance_table.item(0, col)
-                if it is None:
-                    it = QTableWidgetItem(""); self.tolerance_table.setItem(0, col, it)
-                it.setTextAlignment(Qt.AlignCenter); it.setText(txt); it.setBackground(WHITE)
-            finally:
-                self.tolerance_table.blockSignals(False)
+            self._sync_tol_from_main()
             self.recheck_column(col)
             return
-
-        # если изменили скрытую колонку 0 main (через код) — обновим info_table
         if col == 0:
-            try:
-                self.info_table.blockSignals(True)
-                src = self.table.item(row, 0)
-                txt = src.text() if src else ""
-                it = self.info_table.item(row, 0)
-                if it is None:
-                    it = QTableWidgetItem(""); self.info_table.setItem(row, 0, it)
-                it.setText(txt)
-            finally:
-                self.info_table.blockSignals(False)
+            # изменили скрытую кол.0 в main (через код/загрузку)
+            self._sync_info_main_from_main()
             return
 
         # обычные данные — раскрасить
@@ -645,7 +747,8 @@ class MiniOdsEditor(QWidget):
         finally:
             self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
 
-        # скрыть служебные строки и колонку 0, синхронизировать панели
+        # скрыть служебные строки и колонку 0, синхронизировать панели и левые виджеты
+        """
         if self.table.rowCount() > TOL_ROW:
             self.table.setRowHidden(TOL_ROW, True)
         for r in HEADER_ROWS:
@@ -653,10 +756,12 @@ class MiniOdsEditor(QWidget):
                 self.table.setRowHidden(r, True)
         if self.table.columnCount() > 0:
             self.table.setColumnHidden(0, True)
-
-        self._ensure_hdr_panel_cols(); self._sync_hdr_from_main()
-        self._ensure_tol_panel_cols(); self._sync_tol_from_main()
-        self._sync_info_from_main()
+        """
+        
+        self._ensure_panel_cols()
+        self._sync_header_from_main()
+        self._sync_tol_from_main()
+        self._sync_info_main_from_main()
 
         if truncated:
             QMessageBox.information(
