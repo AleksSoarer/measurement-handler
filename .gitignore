@@ -1,5 +1,9 @@
 venv/
 data/
+tmp/
+dist/
+build/
+*.log
 *.pdf
 *.ods
 main0.py
