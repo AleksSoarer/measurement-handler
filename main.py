@@ -358,6 +358,7 @@ class MiniOdsEditor(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setVisible(False) 
         self.table.cellChanged.connect(self.on_cell_changed)
+        
         right_stack.addWidget(self.table, stretch=1)   # важно: пусть main тянется
         # под основной таблицей — полоса счётчиков
         right_stack.addWidget(self.oos_table)
