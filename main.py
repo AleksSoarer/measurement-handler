@@ -30,14 +30,16 @@ BLUE  = QColor("#9DC3E6")  # good data
 WHITE = QColor("#FFFFFF")  #
 BLACK = QColor("#000000")  # NoMeasure
 TEXT  = QColor("#000000")  #
+YELLOW = QColor("#FFF2CC") # changed nominal
 
 
 # ---- Layout sizes ----
 HDR_PANEL_HEIGHT = 140
 TOL_PANEL_HEIGHT = 70
-INFO_COL_WIDTH   = 200  # ширина левого фиксированного столбца
+INFO_COL_WIDTH   = 250  # ширина левого фиксированного столбца
 
 # ---- Special rows (0-based in MAIN table) ----
+MEASURE_INDEX_ROW = 2    # третья строка (0-based)
 HEADER_ROWS    = [3, 4]  # «шапка», показываем сверху в отдельном виджете
 NOMINAL_ROW    = 4       # 5-я строка: номинал (информативно)
 TOL_ROW        = 5       # 6-я строка: допуск (редактируется в панели)
@@ -96,8 +98,8 @@ def _render_textpage_to_pdf(self, out_path: str, html_body: str):
     doc.setHtml(html_body)
     doc.print_(printer)
 
-def _draw_widget_fit(self, painter: QPainter, widget, page_rect: QRectF, margin_mm: float = 10.0):
-    """Рисуем виджет (таблицу) на страницу с сохранением пропорций и полями."""
+"""def _draw_widget_fit(self, painter: QPainter, widget, page_rect: QRectF, margin_mm: float = 10.0):
+    ""Рисуем виджет (таблицу) на страницу с сохранением пропорций и полями.""
     # внутреннее поле
     dp_rect = QRectF(page_rect)
     # отступы примерно в миллиметрах -> через коэффициент dpi: возьмём относительный отступ
@@ -128,7 +130,7 @@ def _draw_widget_fit(self, painter: QPainter, widget, page_rect: QRectF, margin_
     target = QRectF(x, y, w, h)
 
     painter.drawPixmap(target, pm, img_rect)
-
+"""
 
 def _fmt_serial(s: str) -> str:
     """Вернуть '283' вместо '283.0' (и '283,0'). Остальное — без изменений."""
@@ -177,7 +179,7 @@ def _cell_has_content(cell: TableCell) -> bool:
             if getattr(node, 'data', None):
                 return True
     return False
-
+"""
 def _sheet_content_bounds(sheet: Table):
     content_cols = 0
     content_rows = 0
@@ -202,7 +204,7 @@ def _sync_left_caption_height(self):
     if self.table.rowCount() > FIRST_DATA_ROW:
         h = self.table.rowHeight(FIRST_DATA_ROW)
         self.info_main_caption.setFixedHeight(h)
-
+"""
 
 class MiniOdsEditor(QWidget):
     def __init__(self):
@@ -447,6 +449,9 @@ class MiniOdsEditor(QWidget):
         self.info_tol_table.cellChanged.connect(self.on_info_tol_cell_changed)
         self.info_main_table.cellChanged.connect(self.on_info_main_cell_changed)
 
+        self._orig_tol_texts = []   # базовые значения допусков (строка TOL_ROW)
+        self._changed_tols = {}     # {col: (old_text, new_text)}
+
         # Init
         self.build_table()
 
@@ -454,6 +459,8 @@ class MiniOdsEditor(QWidget):
         self.table.horizontalScrollBar().valueChanged.connect(self.oos_table.horizontalScrollBar().setValue)
         # oos_table без собственных полос, но связь в обе стороны не помешает
         self.oos_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+
+
 
     # ---------- UI setup helpers ----------
     def _apply_service_row_visibility(self):
@@ -511,6 +518,78 @@ class MiniOdsEditor(QWidget):
         #tw.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
         tw.setStyleSheet("QTableWidget::item { padding: 4px; }")
         f = tw.font(); f.setPointSizeF(UI_FONT_PT); tw.setFont(f)
+
+
+    #------- Хэлперы для контроля допусков -------
+    def _snapshot_orig_tolerances(self):
+        """Зафиксировать «исходные» допуски как базу сравнения и снять подсветку."""
+        cols = self.table.columnCount()
+        self._orig_tol_texts = []
+        for c in range(cols):
+            it = self.table.item(TOL_ROW, c)
+            self._orig_tol_texts.append((it.text().strip() if it else ""))
+        self._changed_tols.clear()
+        self._apply_tol_highlight()
+
+    def _canon_tol(self, s: str):
+        """Канонизированное представление допуска для сравнения."""
+        s = (s or "").strip().replace(",", ".")
+        try:
+            # округлим чуть-чуть, чтобы 1 и 1.0 считались равными
+            return round(float(s), 9)
+        except Exception:
+            return s.lower()
+
+    def _mark_tol_change(self, col: int):
+        """Проверить и отметить, изменился ли допуск в колонке col относительно базового."""
+        if col <= 0 or col >= self.table.columnCount():
+            return
+        new_txt = (self.table.item(TOL_ROW, col).text().strip()
+                if self.table.item(TOL_ROW, col) else "")
+        orig_txt = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
+        if self._canon_tol(new_txt) == self._canon_tol(orig_txt):
+            self._changed_tols.pop(col, None)
+        else:
+            self._changed_tols[col] = (orig_txt, new_txt)
+        self._apply_tol_highlight()
+
+    def _measure_label(self, c: int) -> str:
+        """Подпись измерения для колонки c — из третьей строки, иначе номер колонки."""
+        if 0 <= MEASURE_INDEX_ROW < self.table.rowCount():
+            it = self.table.item(MEASURE_INDEX_ROW, c)
+            lab = (it.text() if it else "").strip()
+            if lab:
+                return lab
+        return str(c)
+
+    def _apply_tol_highlight(self):
+        """Заливка жёлтым тех «номеров измерений» в order_table, у которых допуски изменены."""
+        cols = self.order_table.columnCount()
+        self.order_table.blockSignals(True)
+        for c in range(cols):
+            it = self.order_table.item(0, c)
+            if it is None:
+                it = QTableWidgetItem("")
+                self.order_table.setItem(0, c, it)
+            if c == 0:
+                it.setBackground(WHITE)
+            else:
+                it.setBackground(YELLOW if c in self._changed_tols else WHITE)
+        self.order_table.blockSignals(False)
+
+    def _changed_tolerances_html(self) -> str:
+        """HTML-блок со списком изменённых допусков. Пустая строка, если изменений нет."""
+        if not self._changed_tols:
+            return ""
+        items = []
+        for c in sorted(self._changed_tols.keys()):
+            old_txt, new_txt = self._changed_tols[c]
+            label = self._measure_label(c)
+            items.append(
+                f"<li>Измерение <b>{html.escape(label)}</b>: было <i>{html.escape(old_txt or '—')}</i>, "
+                f"стало <i>{html.escape(new_txt or '—')}</i></li>"
+            )
+        return "<h3>Изменённые допуски:</h3><ul>" + "".join(items) + "</ul>"
 
     # ---------- Coloring rules ----------
     def _get_tol(self, col):
@@ -745,11 +824,15 @@ class MiniOdsEditor(QWidget):
             fname = os.path.basename(getattr(self, "current_file_path", "") or "")
             header = f"<p style='font-size:12pt;'><b>{html.escape(fname)}</b></p>" if fname else ""
 
+            #изменённые допуски
+            changed_block = self._changed_tolerances_html()
+
             text_page_html = (
                 header +
                 "<h2>Брак:</h2>"
                 f"<p>{bad_html}</p>"
                 f"<p><b>Итого брак:</b> {total_bad}</p>"
+                + (changed_block or "") +   
                 "<p><br/></p><p><br/></p>"
                 f"<p>{PDF_ABOUT_TEXT}</p>"
             )
@@ -1150,10 +1233,11 @@ class MiniOdsEditor(QWidget):
         self.info_header_table.blockSignals(False)
 
     def _sync_order_row(self):
-        """Обновить 1-based нумерацию колонок в полосе order_table и подогнать ширины."""
+        """Подписи в верхней полосе (order_table) = номера измерений из третьей строки.
+        Подсветка жёлтым — для измерений с изменённым допуском.
+        """
         cols = self.table.columnCount()
 
-        # кол-во колонок и ячейки
         if self.order_table.columnCount() != cols:
             self.order_table.blockSignals(True)
             self.order_table.setColumnCount(cols)
@@ -1165,26 +1249,28 @@ class MiniOdsEditor(QWidget):
                 self.order_table.item(0, c).setTextAlignment(Qt.AlignCenter)
             self.order_table.blockSignals(False)
 
-        # ширины как у основной таблицы
         for c in range(cols):
             self.order_table.setColumnWidth(c, self.table.columnWidth(c))
 
-        # 0-й столбец – описательный: скрываем и НЕ нумеруем
         if cols > 0:
             self.order_table.setColumnHidden(0, True)
 
-        # проставить метки 1..N-1 для c >= 1
         self.order_table.blockSignals(True)
         for c in range(cols):
             it = self.order_table.item(0, c)
             if it is None:
                 it = QTableWidgetItem("")
                 self.order_table.setItem(0, c, it)
-            it.setBackground(WHITE)       # никогда не красим
-            it.setText("" if c == 0 else str(c))  # тут и есть нумерация с 1
+
+            if c == 0:
+                it.setText("")
+                it.setBackground(WHITE)
+            else:
+                it.setText(self._measure_label(c))
+                # важное: НЕ затираем подсветку; выставляем в соответствии с изменениями
+                it.setBackground(YELLOW if c in self._changed_tols else WHITE)
         self.order_table.blockSignals(False)
 
-        # 
         self._sync_bars_and_captions_height()
 
 
@@ -1403,6 +1489,7 @@ class MiniOdsEditor(QWidget):
             self.table.blockSignals(False)
             self.table.horizontalScrollBar().setValue(0)
             self.order_table.horizontalScrollBar().setValue(0)
+            self._snapshot_orig_tolerances()
 
     def on_tol_cell_changed(self, row, col):
         if col < 0: return
@@ -1415,11 +1502,14 @@ class MiniOdsEditor(QWidget):
             it.setText(txt); it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
+
         self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
         self._rebuild_tol_cache()
         self.recheck_column(col)
         self._recompute_oos_counts()
         self._recompute_total_defects()
+        self._mark_tol_change(col)   # зафиксировать изменение и включить жёлтую подсветку
+        self._sync_order_row()       # на всякий случай обновить подписи/ширины и сохранить подсветку
 
     def on_cell_changed(self, row, col):
         # отражаем возможные изменения скрытых строк в панели/левых таблицах
@@ -1430,6 +1520,7 @@ class MiniOdsEditor(QWidget):
             self._sync_tol_from_main()
             self._rebuild_tol_cache()
             self.recheck_column(col)
+            self._mark_tol_change(col)
             return
         if col == 0:
             # изменили скрытую кол.0 в main (через код/загрузку)
@@ -1738,6 +1829,7 @@ class MiniOdsEditor(QWidget):
             self._recompute_oos_counts()       # теперь tol на месте
             self._sync_bars_and_captions_height()
             self._recompute_total_defects()
+            self._snapshot_orig_tolerances()
 
             if truncated:
                 QMessageBox.information(
@@ -1747,49 +1839,6 @@ class MiniOdsEditor(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
-    """def export_pdf_with_prefix_tableonly(self):
-        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF (пойдёт в начало)", "", "PDF Files (*.pdf)")
-        if not in_path:
-            return
-        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "merged.pdf", "PDF Files (*.pdf)")
-        if not out_path:
-            return
-
-        # 1) offscreen-копия всей таблицы
-        tw = self._build_offscreen_table_for_pdf()
-
-        # 2) печать на один лист во временный PDF
-        fd, tmp_pdf = tempfile.mkstemp(suffix=".pdf"); os.close(fd)
-        try:
-            self._print_table_to_single_pdf(tmp_pdf, tw)
-
-            # 3) склейка: сначала входной PDF, затем наш лист
-            writer = PdfWriter()
-            r1 = PdfReader(in_path)
-            if getattr(r1, "is_encrypted", False):
-                try:
-                    r1.decrypt("")
-                except Exception:
-                    QMessageBox.warning(self, "Ошибка", "Входной PDF зашифрован.")
-                    return
-            for p in r1.pages:
-                writer.add_page(p)
-
-            r2 = PdfReader(tmp_pdf)
-            for p in r2.pages:
-                writer.add_page(p)
-
-            with open(out_path, "wb") as f:
-                writer.write(f)
-
-            QMessageBox.information(self, "Готово", f"PDF сохранён:\n{out_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Не удалось собрать PDF", str(e))
-        finally:
-            try: os.remove(tmp_pdf)
-            except Exception: pass
-            tw.deleteLater()
-    """
 
     def _print_whole_table_to_single_pdf(self, pdf_path, table, font_pt):
         """Печатает ИМЕННО всю основную таблицу (включая скрытые служебные строки и колонку 0)
