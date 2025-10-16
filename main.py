@@ -22,12 +22,13 @@ from PyQt5.QtWidgets import QTableView, QListView, QScrollArea
 from pypdf import PdfReader, PdfWriter
 
 # ---- Colors ----
-GREEN = QColor("#1A8830")   # ok data
-RED   = QColor("#8D1926")   # bad data
-BLUE  = QColor("#265C8F")   # good data
-WHITE = QColor("#FFFFFF")   #
-BLACK = QColor("#000000")   # NoMeasure
-TEXT = QColor("#000000")    #
+GREEN = QColor("#C6EFCE")  # ok data
+RED   = QColor("#FFC7CE")  # bad data
+BLUE  = QColor("#9DC3E6")  # good data
+WHITE = QColor("#FFFFFF")  #
+BLACK = QColor("#000000")  # NoMeasure
+TEXT  = QColor("#000000")  #
+
 
 # ---- Layout sizes ----
 HDR_PANEL_HEIGHT = 140
@@ -40,7 +41,7 @@ NOMINAL_ROW    = 4       # 5-я строка: номинал (информати
 TOL_ROW        = 5       # 6-я строка: допуск (редактируется в панели)
 FIRST_DATA_ROW = 6       # данные с 7-й строки
 
-MAX_CELLS = 200_000
+MAX_CELLS = 300_000
 
 # ---- Export font size (для ODS и PDF) ----
 EXPORT_FONT_PT = 24.0   # меняй одно число: шрифт в сохраняемых файлах
@@ -1471,7 +1472,6 @@ class MiniOdsEditor(QWidget):
 
         from PyQt5.QtWidgets import QApplication
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        truncated = False
 
         try:
             doc = load(path)
@@ -1480,18 +1480,19 @@ class MiniOdsEditor(QWidget):
                 return
             sheet = tables[0]
 
-            rows_buf = []   # список строк; строка = список текстов ячеек до последней непустой
+            # ---------- 1) ПЕРВЫЙ ПРОХОД: считаем нужное кол-во строк/колонок ----------
+            row_specs = []   # список: (useful_cols, rrep, blocks) ; blocks = [(txt, crep), ...]
             max_cols = 0
-            total_cells = 0
+            last_content_row_idx = -1
+            cum_rows = 0
 
-            # --- читаем построчно, отрезая хвостовые пустоты и уважая MAX_CELLS ---
             for row in sheet.getElementsByType(TableRow):
                 rrep = int(row.getAttribute('numberrowsrepeated') or 1)
 
-                # 1) первый проход: собираем блоки (text, crep) и находим индекс последней непустой колонки
                 blocks = []
                 col_idx = 0
                 last_non_empty = -1
+
                 for cell in row.getElementsByType(TableCell):
                     crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
                     txt = _extract_text_from_cell(cell)
@@ -1500,14 +1501,47 @@ class MiniOdsEditor(QWidget):
                         last_non_empty = col_idx + crep - 1
                     col_idx += crep
 
-                useful_cols = last_non_empty + 1
-                if useful_cols <= 0:
-                    # вся строка пуста — пропускаем даже при rrep > 1
-                    continue
+                useful_cols = last_non_empty + 1  # 0 если строка полностью пустая
+                row_specs.append((useful_cols, rrep, blocks))
 
-                # 2) второй проход: расширяем ТОЛЬКО до useful_cols (не разворачивая хвостовую пустоту)
+                if useful_cols > 0:
+                    last_content_row_idx = cum_rows + rrep - 1
+                    if useful_cols > max_cols:
+                        max_cols = useful_cols
+
+                cum_rows += rrep
+
+            # сколько строк реально нужно загрузить:
+            needed_rows = max(last_content_row_idx + 1, FIRST_DATA_ROW + 1)
+            if max_cols <= 0:
+                # вообще нет контента — подготовим минимальную таблицу
+                self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
+                try:
+                    self.table.clearContents()
+                    self.table.setRowCount(1); self.table.setColumnCount(1)
+                    self.sb_rows.setValue(1); self.sb_cols.setValue(1)
+                    it = QTableWidgetItem(""); it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
+                    self.table.setItem(0, 0, it)
+                finally:
+                    self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+                return
+
+            # ограничение по общему числу ячеек
+            max_rows_by_cells = max(1, MAX_CELLS // max(1, max_cols))
+            use_rows = min(needed_rows, max_rows_by_cells)
+            truncated = use_rows < needed_rows
+            use_cols = max_cols
+
+            # ---------- 2) ВТОРОЙ ПРОХОД: разворачиваем строки до use_rows/use_cols ----------
+            rows_buf = []
+            for useful_cols, rrep, blocks in row_specs:
+                if len(rows_buf) >= use_rows:
+                    break
+
+                # соберём строку до useful_cols (не разворачиваем хвостовую пустоту)
+                useful = min(useful_cols, use_cols)
                 row_line = []
-                remain = useful_cols
+                remain = useful
                 for txt, crep in blocks:
                     if remain <= 0:
                         break
@@ -1516,37 +1550,20 @@ class MiniOdsEditor(QWidget):
                         row_line.extend([txt] * vis)
                         remain -= vis
 
-                # 3) учитываем повтор строк
-                for _ in range(rrep):
-                    rows_buf.append(row_line[:])
-                    max_cols = max(max_cols, useful_cols)
-                    total_cells += useful_cols
-                    if total_cells >= MAX_CELLS:
-                        truncated = True
-                        break
-                if truncated:
-                    break
+                # добьём до use_cols пустыми, чтобы ширина везде одинаковая
+                if useful < use_cols:
+                    row_line.extend([""] * (use_cols - useful))
 
-                # чтобы UI чувствовал себя живо на больших файлах
+                # добавим rrep раз, но не больше нужного
+                times = min(rrep, use_rows - len(rows_buf))
+                for _ in range(times):
+                    rows_buf.append(list(row_line))
+
+                # чтобы UI не «замирал» на больших файлах
                 if (len(rows_buf) & 0xFF) == 0:
                     QApplication.processEvents()
 
-            # если совсем пусто
-            if not rows_buf:
-                try:
-                    self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
-                    self.table.clearContents(); self.table.setRowCount(1); self.table.setColumnCount(1)
-                    self.sb_rows.setValue(1); self.sb_cols.setValue(1)
-                    it = QTableWidgetItem(""); it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
-                    self.table.setItem(0, 0, it)
-                finally:
-                    self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
-                return
-
-            use_rows = len(rows_buf)
-            use_cols = max_cols
-
-            # --- заполняем таблицу (без покраски в цикле) ---
+            # ---------- 3) Загрузка в QTableWidget ----------
             try:
                 self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
                 self.table.clearContents()
@@ -1557,6 +1574,7 @@ class MiniOdsEditor(QWidget):
                 self.sb_rows.setValue(final_rows)
                 self.sb_cols.setValue(use_cols)
 
+                # фактические строки из файла
                 for r in range(use_rows):
                     row_vals = rows_buf[r]
                     for c in range(use_cols):
@@ -1568,7 +1586,7 @@ class MiniOdsEditor(QWidget):
                         it.setTextAlignment(Qt.AlignCenter)
                         it.setText(_fmt_serial(txt) if c == 0 else txt)
 
-                # пустой «хвост», если final_rows > use_rows
+                # хвост до final_rows — чистые белые строки
                 for r in range(use_rows, final_rows):
                     for c in range(use_cols):
                         it = self.table.item(r, c)
@@ -1580,7 +1598,7 @@ class MiniOdsEditor(QWidget):
             finally:
                 self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
 
-            # --- обычная синхронизация + покраска разом ---
+            # ---------- 4) Синхронизация/пересчёт ----------
             self._apply_service_row_visibility()
             if self.table.columnCount() > 0:
                 self.table.setColumnHidden(0, True)
@@ -1588,25 +1606,23 @@ class MiniOdsEditor(QWidget):
             self._ensure_panel_cols()
             self._sync_header_from_main()
             self._sync_tol_from_main()
-            self._rebuild_tol_cache()
+            self._rebuild_tol_cache()          # ВАЖНО: после загрузки!
             self._sync_info_main_from_main()
             self._sync_order_row()
             self.table.horizontalScrollBar().setValue(0)
             self.order_table.horizontalScrollBar().setValue(0)
-            self._recompute_oos_counts()
-            self._sync_bars_and_captions_height()
             self.recolor_all()
+            self._recompute_oos_counts()       # теперь tol на месте
+            self._sync_bars_and_captions_height()
             self._recompute_total_defects()
 
             if truncated:
                 QMessageBox.information(
-                    self,
-                    "Файл урезан",
-                    f"Загружено примерно {use_rows}×{use_cols} (ограничение ≈ {MAX_CELLS:,} ячеек)."
+                    self, "Файл урезан",
+                    f"Загружено {use_rows}×{use_cols} (лимит ≈ {MAX_CELLS:,} ячеек)."
                 )
         finally:
             QApplication.restoreOverrideCursor()
-
 
     def export_pdf_with_prefix_tableonly(self):
         in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF (пойдёт в начало)", "", "PDF Files (*.pdf)")
