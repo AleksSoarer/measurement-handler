@@ -170,7 +170,21 @@ class MiniOdsEditor(QWidget):
         #center.setContentsMargins(0, 0, 0, 0)      # <-- добавь
         root.addLayout(center, stretch=1)
 
-        
+        # ==== TOTAL DEFECTS STRIP (отдельное окошко) ====
+        total_bar = QHBoxLayout()
+        total_bar.setContentsMargins(0, 6, 0, 0)
+        total_bar.setSpacing(8)
+
+        lbl_total = QLabel("Итого брак:")
+        lbl_total.setStyleSheet("font-weight:600;")
+        self.total_defects_lbl = QLabel("0")
+        self.total_defects_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.total_defects_lbl.setStyleSheet("font-weight:700; padding:4px 8px; border:1px solid #ccc; border-radius:6px;")
+
+        total_bar.addStretch(1)
+        total_bar.addWidget(lbl_total)
+        total_bar.addWidget(self.total_defects_lbl)
+        root.addLayout(total_bar)
 
         # left main info (col0 for all rows, except hidden 1,2,5 — мы их тоже скрываем здесь)
         self.info_main_table = QTableWidget(0, 1, self)
@@ -380,7 +394,8 @@ class MiniOdsEditor(QWidget):
         tw.horizontalHeader().setVisible(False)
         tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
         tw.setColumnWidth(0, INFO_COL_WIDTH)
-        tw.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
+        #tw.setStyleSheet("QTableWidget::item { background: white; padding: 4px; }")
+        tw.setStyleSheet("QTableWidget::item { padding: 4px; }")
 
     # ---------- Coloring rules ----------
     def _get_tol(self, col):
@@ -401,34 +416,56 @@ class MiniOdsEditor(QWidget):
         text = text_raw.strip()
         up = text.upper()
 
-        # колонки 0 в MAIN скрыта и служит источником для left info — держим белым
+
+        # кол.0 оставляем белым
         if col == 0:
-            it.setBackground(WHITE); return
+            it.setBackground(WHITE)
+            it.setForeground(TEXT)
+            return
 
         # служебные строки — не красим
         if row in HEADER_ROWS or row in (NOMINAL_ROW, TOL_ROW):
-            it.setBackground(WHITE); return
+            it.setBackground(WHITE)
+            it.setForeground(TEXT)
+            return
 
-        if up in ("N", "NM"):
-            it.setBackground(RED); return
+        # NM -> чёрный фон, белый текст
+        if up == "NM":
+            it.setBackground(BLACK)
+            it.setForeground(WHITE)
+            return
+
+        # N -> красный (как и раньше)
+        if up == "N":
+            it.setBackground(RED)
+            it.setForeground(WHITE if RED == BLACK else TEXT)  # можно оставить TEXT, если читается
+            return
+
+        # Y -> зелёный (как и раньше)
         if up == "Y":
-            it.setBackground(GREEN); return
+            it.setBackground(GREEN)
+            it.setForeground(TEXT)
+            return
 
-        f = try_parse_float(text)
-
+        # дальше — числовая логика (синий в допуске / красный вне допуска)
+        f = try_parse_float(it.text() or "")
         if (row >= FIRST_DATA_ROW) and (col > 0):
             tol = self._get_tol(col)
             if tol is not None and f is not None:
                 it.setBackground(BLUE if abs(f) <= tol else RED)
+                it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
                 return
 
         # fallback
-        if has_letters(text):
+        if has_letters(it.text()):
             it.setBackground(RED)
-        elif has_digits(text):
+            it.setForeground(TEXT)
+        elif has_digits(it.text()):
             it.setBackground(GREEN)
+            it.setForeground(TEXT)
         else:
             it.setBackground(WHITE)
+            it.setForeground(TEXT)
 
     def recolor_all(self):
         try:
@@ -452,6 +489,79 @@ class MiniOdsEditor(QWidget):
                 self.recolor_cell(it, r, col)
         finally:
             self.table.blockSignals(False)
+
+    
+    def _is_row_defective(self, r: int) -> bool:
+        """
+        Строка бракована, если:
+        - есть 'N' в любой ячейке c >= 1, ИЛИ
+        - есть число вне допуска, ИЛИ
+        - вся строка измерений пуста (для c >= 1).
+        'NM' не считаем браком.
+        """
+        cols = self.table.columnCount()
+        if cols <= 1:
+            return True  # нет измерений — считаем браком
+
+        has_any_value = False
+        tol_cache = {}
+
+        for c in range(1, cols):
+            it = self.table.item(r, c)
+            txt = (it.text() if it else "").strip()
+            up = txt.upper()
+
+            if txt != "":
+                has_any_value = True
+
+            # 'N' => брак (NM не считаем)
+            if up == "N":
+                return True
+            if up == "NM":
+                continue  # специально не считаем браком
+
+            # проверка по допуску (если есть число и задан допуск)
+            f = try_parse_float(txt)
+            if f is not None:
+                if c not in tol_cache:
+                    tol_cache[c] = self._get_tol(c)
+                tol = tol_cache[c]
+                if tol is not None and abs(f) > tol:
+                    return True
+
+        # если значений не было вообще — пустая строка => брак
+        return not has_any_value
+
+
+    def _recompute_total_defects(self):
+        """Общий счётчик брака по строкам + подсветка серийных номеров бракованных строк."""
+        rows = self.table.rowCount()
+        if rows <= FIRST_DATA_ROW:
+            self.total_defects_lbl.setText("0")
+            return
+
+        total_bad = 0
+        for r in range(FIRST_DATA_ROW, rows):
+            is_bad = self._is_row_defective(r)
+            if is_bad:
+                total_bad += 1
+
+            # подсветить серийник слева (и в скрытой col0, на всякий случай)
+            # info_main_table слева
+            it_left = self.info_main_table.item(r, 0)
+            if it_left is not None:
+                it_left.setBackground(RED if is_bad else WHITE)
+                it_left.setForeground(WHITE if is_bad else TEXT)
+
+            # скрытая основная col0
+            it0 = self.table.item(r, 0)
+            if it0 is not None:
+                it0.setBackground(RED if is_bad else WHITE)
+                it0.setForeground(WHITE if is_bad else TEXT)
+
+        self.total_defects_lbl.setText(str(total_bad))
+
+    
 
     # ---------- Panels/Info sync helpers ----------
     
@@ -707,6 +817,7 @@ class MiniOdsEditor(QWidget):
     def on_info_main_cell_changed(self, row, col):
         raw = self.info_main_table.item(row, col).text() if self.info_main_table.item(row, col) else ""
         txt = _fmt_serial(raw)
+        self.info_main_table.item(row, 0).setText(txt)
         it = self.table.item(row, 0)
         # обновляем левый виджет (на случай, если пользователь ввёл 283.0)
         self.info_main_table.item(row, 0).setText(txt)
@@ -714,7 +825,8 @@ class MiniOdsEditor(QWidget):
             it = QTableWidgetItem(""); self.table.setItem(row, 0, it)
         try:
             self.table.blockSignals(True)
-            it.setText(txt); it.setBackground(WHITE)
+            it.setText(txt) 
+            #it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
 
@@ -793,6 +905,7 @@ class MiniOdsEditor(QWidget):
             self._recompute_oos_counts()
             self._sync_bars_and_captions_height()
             self.recolor_all()
+            self._recompute_total_defects()
 
         finally:
             self.table.blockSignals(False)
@@ -813,6 +926,7 @@ class MiniOdsEditor(QWidget):
         self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
         self.recheck_column(col)
         self._recompute_oos_counts()
+        self._recompute_total_defects()
 
     def on_cell_changed(self, row, col):
         # отражаем возможные изменения скрытых строк в панели/левых таблицах
@@ -834,6 +948,10 @@ class MiniOdsEditor(QWidget):
 
         if col > 0 and row >= FIRST_DATA_ROW:
             self._recompute_oos_counts()
+            self._recompute_total_defects()
+        elif col == 0 and row >= FIRST_DATA_ROW:
+            # меняли серийник — могло стать "пустая строка" по факту? да, но считаем по c>=1.
+            self._recompute_total_defects()
 
     # не в допуске 
     def _recompute_oos_counts(self):
@@ -1038,6 +1156,7 @@ class MiniOdsEditor(QWidget):
         self._recompute_oos_counts()
         self._sync_bars_and_captions_height()
         self.recolor_all()
+        self._recompute_total_defects() 
 
         if truncated:
             QMessageBox.information(
