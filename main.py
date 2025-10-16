@@ -98,39 +98,6 @@ def _render_textpage_to_pdf(self, out_path: str, html_body: str):
     doc.setHtml(html_body)
     doc.print_(printer)
 
-"""def _draw_widget_fit(self, painter: QPainter, widget, page_rect: QRectF, margin_mm: float = 10.0):
-    ""Рисуем виджет (таблицу) на страницу с сохранением пропорций и полями.""
-    # внутреннее поле
-    dp_rect = QRectF(page_rect)
-    # отступы примерно в миллиметрах -> через коэффициент dpi: возьмём относительный отступ
-    # проще: вычислим как 5% от меньшей стороны страницы
-    pad = min(dp_rect.width(), dp_rect.height()) * 0.05 if margin_mm is None else 0
-    if margin_mm is None:
-        dp_rect.adjust(pad, pad, -pad, -pad)
-    else:
-        # Если хочешь реальный мм — можно умножить на dpi/25.4, но для компактности
-        # оставим небольшой фиксированный процент:
-        pad = min(dp_rect.width(), dp_rect.height()) * 0.05
-        dp_rect.adjust(pad, pad, -pad, -pad)
-
-    # Снимок виджета
-    size = widget.size()
-    if size.width() <= 0 or size.height() <= 0:
-        return
-    pm = QPixmap(size)
-    widget.render(pm)
-
-    # Вписываем пропорционально
-    img_rect = QRectF(0, 0, pm.width(), pm.height())
-    scale = min(dp_rect.width() / img_rect.width(), dp_rect.height() / img_rect.height())
-    w = img_rect.width() * scale
-    h = img_rect.height() * scale
-    x = dp_rect.x() + (dp_rect.width() - w) / 2
-    y = dp_rect.y() + (dp_rect.height() - h) / 2
-    target = QRectF(x, y, w, h)
-
-    painter.drawPixmap(target, pm, img_rect)
-"""
 
 def _fmt_serial(s: str) -> str:
     """Вернуть '283' вместо '283.0' (и '283,0'). Остальное — без изменений."""
@@ -179,32 +146,7 @@ def _cell_has_content(cell: TableCell) -> bool:
             if getattr(node, 'data', None):
                 return True
     return False
-"""
-def _sheet_content_bounds(sheet: Table):
-    content_cols = 0
-    content_rows = 0
-    for row in sheet.getElementsByType(TableRow):
-        rrep = int(row.getAttribute('numberrowsrepeated') or 1)
-        row_has_content = False
-        last_col_in_row = -1
-        col_idx = 0
-        for cell in row.getElementsByType(TableCell):
-            crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
-            if _cell_has_content(cell):
-                row_has_content = True
-                last_col_in_row = max(last_col_in_row, col_idx + crep - 1)
-            col_idx += crep
-        if row_has_content:
-            content_rows += rrep
-            content_cols = max(content_cols, last_col_in_row + 1)
-    return content_rows, content_cols
 
-def _sync_left_caption_height(self):
-    # высота первой «рабочей» строки в правой таблице
-    if self.table.rowCount() > FIRST_DATA_ROW:
-        h = self.table.rowHeight(FIRST_DATA_ROW)
-        self.info_main_caption.setFixedHeight(h)
-"""
 
 class MiniOdsEditor(QWidget):
     def __init__(self):
