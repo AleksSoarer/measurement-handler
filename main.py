@@ -14,10 +14,10 @@ from odf.style import Style, TableCellProperties, TextProperties
 from odf.table import Table, TableRow, TableCell
 from odf.text import P
 
-import os, tempfile
+import os, tempfile, html
 from PyQt5.QtPrintSupport import QPrinter
-from PyQt5.QtGui import QPainter
-from PyQt5.QtCore import QRect
+from PyQt5.QtGui import QPainter, QPixmap, QImage, QTextDocument, QFont
+from PyQt5.QtCore import QRect, QRectF, QSizeF, Qt
 from PyQt5.QtWidgets import QTableView, QListView, QScrollArea
 from pypdf import PdfReader, PdfWriter
 
@@ -51,17 +51,85 @@ EXPORT_FONT_PT = 24.0   # меняй одно число: шрифт в сохр
 # ---- UI font size (только виджетам на экране) ----
 UI_FONT_PT = 10.0
 
+PDF_ABOUT_TEXT = (
+    "С учетом изменений допустимых величин отклонений указанных размеров произвести окончательную отбраковку деталей.<br/><br/>"
+    "Достоверность измерений некоторых размеров не подтверждена. Указанные изменения никак не влияют на конструкционные свойства деталей, "
+    "собираемость изделия в целом, его механические свойства, габаритные размеры, массу и т. д. Степень влияния на радиотехнические свойства минимальна, "
+    "что будет подтверждено при проведении обязательного контроля всех радиотехнических характеристик всех изделий. "
+    "По результатам измерений радиотехнических характеристик необходимо внести изменения в конструкторскую документацию."
+)
 
 # ---- Helpers ----
-"""
-def has_letters(s: str) -> bool:
-    # Любая буква: латиница, кириллица и прочие алфавиты
-    return any(ch.isalpha() for ch in (s or ""))
+def _collect_defective_serials(self):
+    """Вернёт список серийников (колонка 0) для строк, помеченных как брак."""
+    bad = []
+    rows = self.table.rowCount()
+    for r in range(FIRST_DATA_ROW, rows):
+        try:
+            if self._is_row_defective(r):
+                it = self.table.item(r, 0)
+                sn = (it.text().strip() if it else "").strip()
+                bad.append(sn or f"ROW {r}")
+        except Exception:
+            # На всякий — пропускаем проблемную строку, чтобы не уронить экспорт
+            continue
+    return bad
 
-def has_digits(s: str) -> bool:
-    # Уже ок, но приведём к единому стилю
-    return any(ch.isdigit() for ch in (s or ""))
-"""
+def _render_textpage_to_pdf(self, out_path: str, html_body: str):
+    """Печатает одну текстовую страницу в PDF через QTextDocument."""
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setOutputFormat(QPrinter.PdfFormat)
+    printer.setOutputFileName(out_path)
+    try:
+        # Новые Qt
+        from PyQt5.QtGui import QPageLayout, QPageSize
+        from PyQt5.QtCore import QMarginsF
+        layout = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, QMarginsF(10,10,10,10))
+        printer.setPageLayout(layout)
+    except Exception:
+        # Старые Qt
+        printer.setPageSize(QPrinter.A4)
+        printer.setOrientation(QPrinter.Portrait)
+
+    doc = QTextDocument()
+    doc.setDefaultFont(QFont("Arial", 11))
+    doc.setHtml(html_body)
+    doc.print_(printer)
+
+def _draw_widget_fit(self, painter: QPainter, widget, page_rect: QRectF, margin_mm: float = 10.0):
+    """Рисуем виджет (таблицу) на страницу с сохранением пропорций и полями."""
+    # внутреннее поле
+    dp_rect = QRectF(page_rect)
+    # отступы примерно в миллиметрах -> через коэффициент dpi: возьмём относительный отступ
+    # проще: вычислим как 5% от меньшей стороны страницы
+    pad = min(dp_rect.width(), dp_rect.height()) * 0.05 if margin_mm is None else 0
+    if margin_mm is None:
+        dp_rect.adjust(pad, pad, -pad, -pad)
+    else:
+        # Если хочешь реальный мм — можно умножить на dpi/25.4, но для компактности
+        # оставим небольшой фиксированный процент:
+        pad = min(dp_rect.width(), dp_rect.height()) * 0.05
+        dp_rect.adjust(pad, pad, -pad, -pad)
+
+    # Снимок виджета
+    size = widget.size()
+    if size.width() <= 0 or size.height() <= 0:
+        return
+    pm = QPixmap(size)
+    widget.render(pm)
+
+    # Вписываем пропорционально
+    img_rect = QRectF(0, 0, pm.width(), pm.height())
+    scale = min(dp_rect.width() / img_rect.width(), dp_rect.height() / img_rect.height())
+    w = img_rect.width() * scale
+    h = img_rect.height() * scale
+    x = dp_rect.x() + (dp_rect.width() - w) / 2
+    y = dp_rect.y() + (dp_rect.height() - h) / 2
+    target = QRectF(x, y, w, h)
+
+    painter.drawPixmap(target, pm, img_rect)
+
+
 def _fmt_serial(s: str) -> str:
     """Вернуть '283' вместо '283.0' (и '283,0'). Остальное — без изменений."""
     f = try_parse_float(s)
@@ -166,9 +234,9 @@ class MiniOdsEditor(QWidget):
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
 
-        self.btn_export_merged = QPushButton("PDF: внешний + таблица")
-        self.btn_export_merged.setToolTip("Склеить: сначала выбранный PDF, затем вся таблица одним листом")
-        self.btn_export_merged.clicked.connect(self.export_pdf_with_prefix_tableonly)
+        self.btn_export_merged = QPushButton("PDF: таблица → брак → чертёж")
+        self.btn_export_merged.setToolTip("Склеить: таблица (1-й лист), затем лист 'Брак', затем выбранный чертёж")
+        self.btn_export_merged.clicked.connect(self.export_report_pdf)  # <-- новое имя!
         ctrl.addWidget(self.btn_export_merged)
 
         ctrl.addStretch()
@@ -389,7 +457,7 @@ class MiniOdsEditor(QWidget):
 
     # ---------- UI setup helpers ----------
     def _apply_service_row_visibility(self):
-        """Спрятать все служебные строки (до FIRST_DATA_ROW) из нижних таблиц."""
+        #Спрятать все служебные строки (до FIRST_DATA_ROW) из нижних таблиц.
         rows = self.table.rowCount()
         # в правой main-таблице
         for r in range(min(rows, FIRST_DATA_ROW)):
@@ -476,7 +544,7 @@ class MiniOdsEditor(QWidget):
 
             if up == "NM":
                 it.setBackground(BLACK); it.setForeground(WHITE); return
-            if up == ("N", "Z"):
+            if up in ("N", "Z"):
                 it.setBackground(RED); it.setForeground(TEXT); return
             if up == "Y":
                 it.setBackground(GREEN); it.setForeground(TEXT); return
@@ -634,53 +702,81 @@ class MiniOdsEditor(QWidget):
 
 
     
-    def export_pdf_with_prefix(self):
+    def export_report_pdf(self):
         """
-        Новый вариант: [входной PDF (все страницы)] + [ВЕСЬ self.table одной страницей].
-        Никаких панелей/капшенов — только «плоская» таблица, как в ODS.
+        Жёсткий новый порядок:
+        1) таблица (одним листом),
+        2) 'Брак' + 'Итого брак' + служебный текст,
+        3) внешний PDF (чертёж) в конце (опционально).
         """
-        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF", "", "PDF Files (*.pdf)")
-        if not in_path:
-            return
+        # Явная подсказка, что запускается НОВЫЙ экспорт
+        QMessageBox.information(self, "Экспорт", "Запущен новый экспорт: Таблица → Брак → Чертёж")
 
-        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "merged.pdf", "PDF Files (*.pdf)")
+        # 0) чертёж (можно пропустить)
+        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери чертёж (PDF) — можно пропустить", "", "PDF Files (*.pdf)")
+
+        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "report.pdf", "PDF Files (*.pdf)")
         if not out_path:
             return
 
-        # 1) соберём плоскую копию всей таблицы (все строки/столбцы, с цветами)
-        flat = self._build_full_table_snapshot()
-
-        # 2) распечатаем ЕЁ на один лист во временный PDF
-        fd, tmp_pdf = tempfile.mkstemp(suffix=".pdf")
-        os.close(fd)
-
-
-        f = flat.font()
-        f.setPointSizeF(EXPORT_FONT_PT)
-        flat.setFont(f)
-        flat.resizeColumnsToContents()
-        flat.resizeRowsToContents()
-
+        # 1) offscreen-копия таблицы
+        flat = self._build_offscreen_table_for_pdf()
+        fd1, tmp_tbl_pdf = tempfile.mkstemp(suffix=".pdf"); os.close(fd1)
+        fd2, tmp_bad_pdf = tempfile.mkstemp(suffix=".pdf"); os.close(fd2)
 
         try:
-            self._print_table_to_single_pdf(tmp_pdf, flat)
+            # шрифт и подгон
+            try:
+                f = flat.font(); f.setPointSizeF(EXPORT_FONT_PT); flat.setFont(f)
+            except Exception:
+                pass
+            flat.resizeColumnsToContents()
+            flat.resizeRowsToContents()
 
-            # 3) склейка: сначала входной, потом наш лист
+            # 2) печать таблицы → tmp_tbl_pdf
+            self._print_table_to_single_pdf(tmp_tbl_pdf, flat)
+
+            # 3) формируем 2-ю страницу (брак)
+            bad_sns = _collect_defective_serials(self)
+            bad_html = ", ".join(html.escape(x) for x in bad_sns) if bad_sns else "—"
+            total_bad = len(bad_sns)
+
+            # имя текущего ods в шапку (добавим сохранение пути ниже)
+            fname = os.path.basename(getattr(self, "current_file_path", "") or "")
+            header = f"<p style='font-size:12pt;'><b>{html.escape(fname)}</b></p>" if fname else ""
+
+            text_page_html = (
+                header +
+                "<h2>Брак:</h2>"
+                f"<p>{bad_html}</p>"
+                f"<p><b>Итого брак:</b> {total_bad}</p>"
+                "<p><br/></p><p><br/></p>"
+                f"<p>{PDF_ABOUT_TEXT}</p>"
+            )
+            _render_textpage_to_pdf(self, tmp_bad_pdf, text_page_html)
+
+            # 4) Склейка: ТАБЛИЦА -> БРАК -> ЧЕРТЁЖ (если задан)
             writer = PdfWriter()
 
-            r1 = PdfReader(in_path)
-            if getattr(r1, "is_encrypted", False):
-                try:
-                    r1.decrypt("")
-                except Exception:
-                    QMessageBox.warning(self, "Ошибка", "Входной PDF зашифрован.")
-                    return
-            for p in r1.pages:
+            r_tbl = PdfReader(tmp_tbl_pdf)
+            for p in r_tbl.pages:
                 writer.add_page(p)
 
-            r2 = PdfReader(tmp_pdf)
-            for p in r2.pages:
+            r_bad = PdfReader(tmp_bad_pdf)
+            for p in r_bad.pages:
                 writer.add_page(p)
+
+            if in_path:
+                r_in = PdfReader(in_path)
+                if getattr(r_in, "is_encrypted", False):
+                    try:
+                        r_in.decrypt("")
+                    except Exception:
+                        QMessageBox.warning(self, "Ошибка", "Выбранный PDF зашифрован, пропускаю чертёж.")
+                        r_in = None
+                if r_in:
+                    for p in r_in.pages:
+                        writer.add_page(p)
 
             with open(out_path, "wb") as f:
                 writer.write(f)
@@ -690,13 +786,11 @@ class MiniOdsEditor(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Провал", f"Не удалось собрать PDF:\n{e}")
         finally:
-            try:
-                os.remove(tmp_pdf)
-            except Exception:
-                pass
-            # не забываем удалить временный виджет
-            flat.deleteLater()
-
+            for tmp in (tmp_tbl_pdf, tmp_bad_pdf):
+                try: os.remove(tmp)
+                except Exception: pass
+            try: flat.deleteLater()
+            except Exception: pass
 
     def _build_offscreen_table_for_pdf(self) -> QTableWidget:
         """Полная автономная копия ВСЕЙ таблицы (включая кол.0 и служебные строки),
@@ -1422,6 +1516,8 @@ class MiniOdsEditor(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", "table.ods", "ODS (*.ods)")
         if not path: return
 
+        self.current_file_path = path
+
 
         #GREEN = QColor("#1A8830")   # soft green
         #RED   = QColor("#8D1926")   # soft red
@@ -1490,10 +1586,13 @@ class MiniOdsEditor(QWidget):
 
     def open_ods(self):
         path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "ODS (*.ods)")
-        self.setWindowTitle(f"Контроль допусков. Имя открытого файла:   {basename(path)}")
+        
         if not path:
             return
-
+        
+        self.current_file_path = path
+        self.setWindowTitle(f"Контроль допусков. Имя открытого файла:   {basename(path)}")
+        
         from PyQt5.QtWidgets import QApplication
         QApplication.setOverrideCursor(Qt.WaitCursor)
 
@@ -1648,7 +1747,7 @@ class MiniOdsEditor(QWidget):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def export_pdf_with_prefix_tableonly(self):
+    """def export_pdf_with_prefix_tableonly(self):
         in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF (пойдёт в начало)", "", "PDF Files (*.pdf)")
         if not in_path:
             return
@@ -1690,7 +1789,7 @@ class MiniOdsEditor(QWidget):
             try: os.remove(tmp_pdf)
             except Exception: pass
             tw.deleteLater()
-
+    """
 
     def _print_whole_table_to_single_pdf(self, pdf_path, table, font_pt):
         """Печатает ИМЕННО всю основную таблицу (включая скрытые служебные строки и колонку 0)
