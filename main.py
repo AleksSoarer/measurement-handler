@@ -1466,117 +1466,147 @@ class MiniOdsEditor(QWidget):
 
     def open_ods(self):
         path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "ODS (*.ods)")
-        if not path: return
-
-        doc = load(path)
-        tables = doc.spreadsheet.getElementsByType(Table)
-        if not tables: return
-        sheet = tables[0]
-
-        
-        content_rows, content_cols = _sheet_content_bounds(sheet)
-        if content_rows == 0 or content_cols == 0:
-            try:
-                self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
-                self.table.clearContents(); self.table.setRowCount(1); self.table.setColumnCount(1)
-                self.sb_rows.setValue(1); self.sb_cols.setValue(1)
-                it = QTableWidgetItem(""); it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
-                self.table.setItem(0, 0, it)
-            finally:
-                self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+        if not path:
             return
 
-        est_cells = content_rows * content_cols
-        truncated = est_cells > MAX_CELLS
-        use_cols = content_cols
-        use_rows = content_rows if not truncated else max(1, MAX_CELLS // max(1, use_cols))
+        from PyQt5.QtWidgets import QApplication
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        truncated = False
 
         try:
-            self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
-            self.table.clearContents()
-            final_rows = max(use_rows, FIRST_DATA_ROW + 1)
-            self.table.setRowCount(final_rows); self.table.setColumnCount(use_cols)
-            self.sb_rows.setValue(final_rows); self.sb_cols.setValue(use_cols)
+            doc = load(path)
+            tables = doc.spreadsheet.getElementsByType(Table)
+            if not tables:
+                return
+            sheet = tables[0]
 
-            row_idx = 0
+            rows_buf = []   # список строк; строка = список текстов ячеек до последней непустой
+            max_cols = 0
+            total_cells = 0
+
+            # --- читаем построчно, отрезая хвостовые пустоты и уважая MAX_CELLS ---
             for row in sheet.getElementsByType(TableRow):
-                if row_idx >= use_rows: break
                 rrep = int(row.getAttribute('numberrowsrepeated') or 1)
 
-                template = []
+                # 1) первый проход: собираем блоки (text, crep) и находим индекс последней непустой колонки
+                blocks = []
                 col_idx = 0
+                last_non_empty = -1
                 for cell in row.getElementsByType(TableCell):
                     crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
-                    vis = min(crep, max(0, use_cols - col_idx))
-                    if vis > 0:
-                        text = _extract_text_from_cell(cell)
-                        template.append((text, vis))
+                    txt = _extract_text_from_cell(cell)
+                    blocks.append((txt, crep))
+                    if (txt or "").strip() != "":
+                        last_non_empty = col_idx + crep - 1
                     col_idx += crep
-                    if col_idx >= use_cols: break
 
+                useful_cols = last_non_empty + 1
+                if useful_cols <= 0:
+                    # вся строка пуста — пропускаем даже при rrep > 1
+                    continue
+
+                # 2) второй проход: расширяем ТОЛЬКО до useful_cols (не разворачивая хвостовую пустоту)
+                row_line = []
+                remain = useful_cols
+                for txt, crep in blocks:
+                    if remain <= 0:
+                        break
+                    vis = crep if crep <= remain else remain
+                    if vis > 0:
+                        row_line.extend([txt] * vis)
+                        remain -= vis
+
+                # 3) учитываем повтор строк
                 for _ in range(rrep):
-                    if row_idx >= use_rows: break
-                    c = 0
-                    for text, vis in template:
-                        for _k in range(vis):
-                            it = self.table.item(row_idx, c)
-                            if it is None:
-                                it = QTableWidgetItem(""); self.table.setItem(row_idx, c, it)
-                            it.setTextAlignment(Qt.AlignCenter)
-                            text_to_set = _fmt_serial(text) if c == 0 else text
-                            it.setText(text_to_set)
-                            self.recolor_cell(it, row_idx, c)
-                            c += 1
-                            if c >= use_cols: break
-                        if c >= use_cols: break
-                    row_idx += 1
+                    rows_buf.append(row_line[:])
+                    max_cols = max(max_cols, useful_cols)
+                    total_cells += useful_cols
+                    if total_cells >= MAX_CELLS:
+                        truncated = True
+                        break
+                if truncated:
+                    break
 
-            # заполнить оставшиеся (если расширили вниз)
-            for r in range(use_rows, final_rows):
-                for c in range(use_cols):
-                    it = self.table.item(r, c)
-                    if it is None:
-                        it = QTableWidgetItem(""); self.table.setItem(r, c, it)
-                    it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
+                # чтобы UI чувствовал себя живо на больших файлах
+                if (len(rows_buf) & 0xFF) == 0:
+                    QApplication.processEvents()
 
+            # если совсем пусто
+            if not rows_buf:
+                try:
+                    self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
+                    self.table.clearContents(); self.table.setRowCount(1); self.table.setColumnCount(1)
+                    self.sb_rows.setValue(1); self.sb_cols.setValue(1)
+                    it = QTableWidgetItem(""); it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
+                    self.table.setItem(0, 0, it)
+                finally:
+                    self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+                return
+
+            use_rows = len(rows_buf)
+            use_cols = max_cols
+
+            # --- заполняем таблицу (без покраски в цикле) ---
+            try:
+                self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
+                self.table.clearContents()
+
+                final_rows = max(use_rows, FIRST_DATA_ROW + 1)
+                self.table.setRowCount(final_rows)
+                self.table.setColumnCount(use_cols)
+                self.sb_rows.setValue(final_rows)
+                self.sb_cols.setValue(use_cols)
+
+                for r in range(use_rows):
+                    row_vals = rows_buf[r]
+                    for c in range(use_cols):
+                        txt = row_vals[c] if c < len(row_vals) else ""
+                        it = self.table.item(r, c)
+                        if it is None:
+                            it = QTableWidgetItem("")
+                            self.table.setItem(r, c, it)
+                        it.setTextAlignment(Qt.AlignCenter)
+                        it.setText(_fmt_serial(txt) if c == 0 else txt)
+
+                # пустой «хвост», если final_rows > use_rows
+                for r in range(use_rows, final_rows):
+                    for c in range(use_cols):
+                        it = self.table.item(r, c)
+                        if it is None:
+                            it = QTableWidgetItem("")
+                            self.table.setItem(r, c, it)
+                        it.setTextAlignment(Qt.AlignCenter)
+                        it.setBackground(WHITE)
+            finally:
+                self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+
+            # --- обычная синхронизация + покраска разом ---
+            self._apply_service_row_visibility()
+            if self.table.columnCount() > 0:
+                self.table.setColumnHidden(0, True)
+
+            self._ensure_panel_cols()
+            self._sync_header_from_main()
+            self._sync_tol_from_main()
+            self._rebuild_tol_cache()
+            self._sync_info_main_from_main()
+            self._sync_order_row()
+            self.table.horizontalScrollBar().setValue(0)
+            self.order_table.horizontalScrollBar().setValue(0)
+            self._recompute_oos_counts()
+            self._sync_bars_and_captions_height()
+            self.recolor_all()
+            self._recompute_total_defects()
+
+            if truncated:
+                QMessageBox.information(
+                    self,
+                    "Файл урезан",
+                    f"Загружено примерно {use_rows}×{use_cols} (ограничение ≈ {MAX_CELLS:,} ячеек)."
+                )
         finally:
-            self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+            QApplication.restoreOverrideCursor()
 
-        # скрыть служебные строки и колонку 0, синхронизировать панели и левые виджеты
-        """
-        if self.table.rowCount() > TOL_ROW:
-            self.table.setRowHidden(TOL_ROW, True)
-        for r in HEADER_ROWS:
-            if r < self.table.rowCount():
-                self.table.setRowHidden(r, True)
-        if self.table.columnCount() > 0:
-            self.table.setColumnHidden(0, True)
-        """
-        self._apply_service_row_visibility()
-        if self.table.columnCount() > 0:
-            self.table.setColumnHidden(0, True)
-        
-        self._ensure_panel_cols()
-        self._sync_header_from_main()
-        self._sync_tol_from_main()
-        self._rebuild_tol_cache()
-        self._sync_info_main_from_main()
-        self._sync_order_row()
-        # чтобы нумерация начиналась с 1 на экране
-        self.table.horizontalScrollBar().setValue(0)
-        self.order_table.horizontalScrollBar().setValue(0)
-        self._recompute_oos_counts()
-        self._sync_bars_and_captions_height()
-        self.recolor_all()
-        self._recompute_total_defects() 
-
-        if truncated:
-            QMessageBox.information(
-                self,
-                "Файл урезан",
-                f"Загружено {use_rows}×{use_cols} из {content_rows}×{content_cols} "
-                f"(лимит ≈ {MAX_CELLS:,} ячеек)."
-            )
 
     def export_pdf_with_prefix_tableonly(self):
         in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF (пойдёт в начало)", "", "PDF Files (*.pdf)")
