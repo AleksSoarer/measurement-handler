@@ -14,6 +14,9 @@ from odf.style import Style, TableCellProperties
 from odf.table import Table, TableRow, TableCell
 from odf.text import P
 
+import os, tempfile, subprocess, shutil
+from pypdf import PdfReader, PdfWriter
+
 # ---- Colors ----
 GREEN = QColor("#1A8830")   # ok data
 RED   = QColor("#8D1926")   # bad data
@@ -37,9 +40,15 @@ MAX_CELLS = 200_000
 
 
 # ---- Helpers ----
+"""
+def has_letters(s: str) -> bool:
+    # Любая буква: латиница, кириллица и прочие алфавиты
+    return any(ch.isalpha() for ch in (s or ""))
 
-
-
+def has_digits(s: str) -> bool:
+    # Уже ок, но приведём к единому стилю
+    return any(ch.isdigit() for ch in (s or ""))
+"""
 def _fmt_serial(s: str) -> str:
     """Вернуть '283' вместо '283.0' (и '283,0'). Остальное — без изменений."""
     f = try_parse_float(s)
@@ -110,19 +119,12 @@ def _sync_left_caption_height(self):
         h = self.table.rowHeight(FIRST_DATA_ROW)
         self.info_main_caption.setFixedHeight(h)
 
-"""
-def has_letters(s: str) -> bool:
-    # Юникод-«буква» для любого алфавита
-    return any(ch.isalpha() for ch in (s or ""))
-
-def has_digits(s: str) -> bool:
-    # Юникод-«цифра»
-    return any(ch.isdigit() for ch in (s or ""))
-"""
 
 class MiniOdsEditor(QWidget):
     def __init__(self):
         super().__init__()
+        self._tol_cache = []
+        self._in_cell_style = False
         self.setWindowTitle("Контроль допусков")
         self.resize(1280, 840)
 
@@ -147,6 +149,7 @@ class MiniOdsEditor(QWidget):
 
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
+        
 
         ctrl.addStretch()
         root.addLayout(ctrl)
@@ -312,12 +315,12 @@ class MiniOdsEditor(QWidget):
         #self.header_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
         #self.tolerance_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
         # Горизонтальный скролл: main <-> order_row
-        #self.table.horizontalScrollBar().valueChanged.connect(self.order_table.horizontalScrollBar().setValue)
-        #self.order_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+        self.table.horizontalScrollBar().valueChanged.connect(self.order_table.horizontalScrollBar().setValue)
+        self.order_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
 
         # Vertical: sync left main info with main
         self.table.verticalScrollBar().valueChanged.connect(self.info_main_table.verticalScrollBar().setValue)
-       # self.info_main_table.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
+        self.info_main_table.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
 
         # Подстраиваем значения при смене диапазона (чтобы не «уплывал» offset)
         self.table.verticalScrollBar().rangeChanged.connect(
@@ -405,63 +408,43 @@ class MiniOdsEditor(QWidget):
 
     # ---------- Coloring rules ----------
     def _get_tol(self, col):
-        if col == 0:
+        if col <= 0:
             return None
-        tol_it = self.table.item(TOL_ROW, col)
-        tol = try_parse_float(tol_it.text()) if tol_it else None
-        return tol
+        if 0 <= col < len(self._tol_cache):
+            return self._tol_cache[col]
+        return None
 
     def recolor_cell(self, it: QTableWidgetItem, row=None, col=None):
         if not it:
             return
-        if row is None or col is None:
-            idx = self.table.indexFromItem(it)
-            row = idx.row(); col = idx.column()
-
-        text_raw = it.text() or ""
-        text = text_raw.strip()
-        up = text.upper()
-
-
-        was_blocked = self.table.signalsBlocked()
-        self.table.blockSignals(True)
+        if self._in_cell_style:
+            return
+        self._in_cell_style = True
         try:
-            text_raw = it.text() or ""
-            text = text_raw.strip()
+            if row is None or col is None:
+                idx = self.table.indexFromItem(it)
+                row = idx.row(); col = idx.column()
+
+            text = (it.text() or "").strip()
             up = text.upper()
 
-            # кол.0 оставляем белым
+            # кол.0
             if col == 0:
-                it.setBackground(WHITE)
-                it.setForeground(TEXT)
-                return
+                it.setBackground(WHITE); it.setForeground(TEXT); return
 
-            # служебные строки — не красим
+            # служебные
             if row in HEADER_ROWS or row in (NOMINAL_ROW, TOL_ROW):
-                it.setBackground(WHITE)
-                it.setForeground(TEXT)
-                return
+                it.setBackground(WHITE); it.setForeground(TEXT); return
 
-            # NM -> чёрный фон, белый текст
             if up == "NM":
-                it.setBackground(BLACK)
-                it.setForeground(WHITE)
-                return
-
-            # N -> красный
+                it.setBackground(BLACK); it.setForeground(WHITE); return
             if up == "N":
-                it.setBackground(RED)
-                it.setForeground(WHITE if RED == BLACK else TEXT)
-                return
-
-            # Y -> зелёный
+                it.setBackground(RED); it.setForeground(TEXT); return
             if up == "Y":
-                it.setBackground(GREEN)
-                it.setForeground(TEXT)
-                return
+                it.setBackground(GREEN); it.setForeground(TEXT); return
 
-            # числовая логика
-            f = try_parse_float(it.text() or "")
+            # числа и допуски
+            f = try_parse_float(text)
             if (row >= FIRST_DATA_ROW) and (col > 0):
                 tol = self._get_tol(col)
                 if tol is not None and f is not None:
@@ -469,21 +452,16 @@ class MiniOdsEditor(QWidget):
                     it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
                     return
 
-            # fallback
-            has_alpha = any(ch.isalpha() for ch in text)
-            has_digit = any(ch.isdigit() for ch in text)
-
-            if has_alpha:
+            # fallback без вызовов it.text() и хелперов
+            if any(ch.isalpha() for ch in text):
                 it.setBackground(RED);   it.setForeground(TEXT)
-            elif has_digit:
+            elif any(ch.isdigit() for ch in text):
                 it.setBackground(GREEN); it.setForeground(TEXT)
             else:
                 it.setBackground(WHITE); it.setForeground(TEXT)
         finally:
-            # возвращаем исходное состояние блокировки сигналов
-            self.table.blockSignals(was_blocked)
+            self._in_cell_style = False
 
-            
     def recolor_all(self):
         try:
             self.table.blockSignals(True)
@@ -506,6 +484,17 @@ class MiniOdsEditor(QWidget):
                 self.recolor_cell(it, r, col)
         finally:
             self.table.blockSignals(False)
+
+    def _rebuild_tol_cache(self):
+        """Считать допуски из TOL_ROW в массив, чтобы раскраска не трогала таблицу."""
+        cols = self.table.columnCount()
+        self._tol_cache = [None] * cols
+        for c in range(cols):
+            if c == 0:
+                continue
+            it = self.table.item(TOL_ROW, c)
+            txt = (it.text() if it else "") or ""
+            self._tol_cache[c] = try_parse_float(txt.strip())
 
     
     def _is_row_defective(self, r: int) -> bool:
@@ -549,59 +538,72 @@ class MiniOdsEditor(QWidget):
         # если значений не было вообще — пустая строка => брак
         return not has_any_value
     
+    def _row_is_empty_measurements(self, r: int) -> bool:
+        cols = self.table.columnCount()
+        if r < FIRST_DATA_ROW or cols <= 1:
+            return True
+        for c in range(1, cols):
+            it = self.table.item(r, c)
+            if it and (it.text() or "").strip():
+                return False
+        return True
+    
+    def _row_is_empty_measurements(self, r: int) -> bool:
+        """True, если во всех ячейках c>=1 пусто (игнорируем служебные строки)."""
+        cols = self.table.columnCount()
+        if cols <= 1 or r < FIRST_DATA_ROW:
+            return True
+        for c in range(1, cols):
+            it = self.table.item(r, c)
+            if it and (it.text() or "").strip() != "":
+                return False
+        return True
+
 
     def _recompute_total_defects(self):
         rows = self.table.rowCount()
+        cols = self.table.columnCount()
         if rows <= FIRST_DATA_ROW:
             self.total_defects_lbl.setText("0")
             return
 
         total_bad = 0
-        cols = self.table.columnCount()
+        self._in_cell_style = True
+        try:
+            for r in range(FIRST_DATA_ROW, rows):
+                is_bad = self._is_row_defective(r)
+                if is_bad:
+                    total_bad += 1
 
-        for r in range(FIRST_DATA_ROW, rows):
-            # проверим, есть ли вообще какие-либо значения в строке (c >= 1)
-            all_empty = True
-            for c in range(1, cols):
-                it = self.table.item(r, c)
-                if it and (it.text() or "").strip() != "":
-                    all_empty = False
-                    break
+                it_left = self.info_main_table.item(r, 0)
+                if it_left is not None:
+                    it_left.setBackground(RED if is_bad else WHITE)
+                    it_left.setForeground(WHITE if is_bad else TEXT)
 
-            is_bad = self._is_row_defective(r)
-            if is_bad:
-                total_bad += 1
+                it0 = self.table.item(r, 0)
+                if it0 is not None:
+                    it0.setBackground(RED if is_bad else WHITE)
+                    it0.setForeground(WHITE if is_bad else TEXT)
 
-            # подсветка серийника слева (и скрытой col0)
-            it_left = self.info_main_table.item(r, 0)
-            if it_left is not None:
-                it_left.setBackground(RED if is_bad else WHITE)
-                it_left.setForeground(WHITE if is_bad else TEXT)
-            it0 = self.table.item(r, 0)
-            if it0 is not None:
-                it0.setBackground(RED if is_bad else WHITE)
-                it0.setForeground(WHITE if is_bad else TEXT)
-
-            # если строка ПОЛНОСТЬЮ пустая — покрасим и сами клетки измерений
-            if all_empty:
-                self._paint_row_no_measurements(r)
+                # заливка пустой бракованной строки
+                is_empty_line = self._row_is_empty_measurements(r)
+                if is_bad and is_empty_line:
+                    for c in range(1, cols):
+                        itc = self.table.item(r, c) or QTableWidgetItem("")
+                        if self.table.item(r, c) is None:
+                            self.table.setItem(r, c, itc)
+                        itc.setBackground(RED)
+                        itc.setForeground(TEXT)
+                else:
+                    for c in range(1, cols):
+                        itc = self.table.item(r, c)
+                        if itc and (itc.text() or "").strip() == "":
+                            itc.setBackground(WHITE)
+                            itc.setForeground(TEXT)
+        finally:
+            self._in_cell_style = False
 
         self.total_defects_lbl.setText(str(total_bad))
-
-    def _paint_row_no_measurements(self, r: int):
-        """Покрасить ВСЮ строку измерений (c >= 1) в красный,
-        если в строке нет ни одного значения (полностью пустая строка)."""
-        cols = self.table.columnCount()
-        for c in range(1, cols):
-            it = self.table.item(r, c)
-            if it is None:
-                it = QTableWidgetItem("")
-                self.table.setItem(r, c, it)
-            # красим только реально пустые (не трогаем N / NM / Y и числа)
-            txt = (it.text() or "").strip()
-            if txt == "":
-                it.setBackground(RED)
-                it.setForeground(WHITE)
 
     # ---------- Panels/Info sync helpers ----------
     
@@ -748,6 +750,8 @@ class MiniOdsEditor(QWidget):
         Прокидываем текст в скрытые строки основной таблицы (HEADER_ROWS)
         и не запускаем перекраску (эти строки всегда белые).
         """
+        if self._in_cell_style:
+            return
         if row < 0 or col < 0:
             return
 
@@ -940,6 +944,7 @@ class MiniOdsEditor(QWidget):
             self._ensure_panel_cols()
             self._sync_header_from_main()
             self._sync_tol_from_main()
+            self._rebuild_tol_cache()
             self._sync_info_main_from_main()
             self._sync_order_row()
             self._recompute_oos_counts()
@@ -964,6 +969,7 @@ class MiniOdsEditor(QWidget):
         finally:
             self.table.blockSignals(False)
         self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
+        self._rebuild_tol_cache()
         self.recheck_column(col)
         self._recompute_oos_counts()
         self._recompute_total_defects()
@@ -975,6 +981,7 @@ class MiniOdsEditor(QWidget):
             return
         if row == TOL_ROW:
             self._sync_tol_from_main()
+            self._rebuild_tol_cache()
             self.recheck_column(col)
             return
         if col == 0:
@@ -1002,7 +1009,7 @@ class MiniOdsEditor(QWidget):
             return
 
         # гарантируем структуру/ширины нижней полосы
-        #self._ensure_panel_cols()
+        self._ensure_panel_cols()
 
         self.oos_table.blockSignals(True)
         for c in range(cols):
@@ -1188,6 +1195,7 @@ class MiniOdsEditor(QWidget):
         self._ensure_panel_cols()
         self._sync_header_from_main()
         self._sync_tol_from_main()
+        self._rebuild_tol_cache()
         self._sync_info_main_from_main()
         self._sync_order_row()
         # чтобы нумерация начиналась с 1 на экране
