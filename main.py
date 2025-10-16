@@ -26,11 +26,11 @@ TOL_ROW     = 5        # 6-я строка: допуск (редактирует
 FIRST_DATA_ROW = 6     # данные с 7-й строки
 
 # Ряды, которые выводим в отдельной «шапке» (и скрываем в основной таблице)
-HEADER_ROWS = [1, 2]   # 2-я и 3-я строки (0-based)
+HEADER_ROWS = [1, 2, 3, 4]   # 2-я и 3-я строки (0-based)
 
 # Высоты закреплённых панелей
-HDR_PANEL_HEIGHT = 60
-TOL_PANEL_HEIGHT = 56
+HDR_PANEL_HEIGHT = 320
+TOL_PANEL_HEIGHT = 80
 
 # Hard cap for table size on load (to avoid OOM)
 MAX_CELLS = 200_000
@@ -349,3 +349,338 @@ class MiniOdsEditor(QWidget):
             self.table.setItem(main_row, col, it)
         try:
             self.table.blockSignals(True)
+            it.setText(txt)
+            it.setBackground(WHITE)
+        finally:
+            self.table.blockSignals(False)
+        # перекраска не нужна — эти строки не красим и они скрыты
+
+    # ---- TOLERANCE PANEL helpers ----
+    def _ensure_tol_panel_cols(self):
+        cols = self.table.columnCount()
+        if self.tolerance_table.columnCount() != cols:
+            self.tolerance_table.blockSignals(True)
+            self.tolerance_table.setColumnCount(cols)
+            for c in range(cols):
+                it = self.tolerance_table.item(0, c)
+                if it is None:
+                    self.tolerance_table.setItem(0, c, QTableWidgetItem(""))
+                self.tolerance_table.item(0, c).setTextAlignment(Qt.AlignCenter)
+            self.tolerance_table.blockSignals(False)
+        # синхронизируем ширины
+        for c in range(cols):
+            w = self.table.columnWidth(c)
+            if self.tolerance_table.columnWidth(c) != w:
+                self.tolerance_table.setColumnWidth(c, w)
+
+    def _sync_tol_from_main(self):
+        """Скопировать значения допусков из скрытой строки основной таблицы в панель."""
+        self._ensure_tol_panel_cols()
+        try:
+            self.tolerance_table.blockSignals(True)
+            cols = self.table.columnCount()
+            for c in range(cols):
+                src = self.table.item(TOL_ROW, c)
+                txt = src.text() if src else ""
+                it = self.tolerance_table.item(0, c)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.tolerance_table.setItem(0, c, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt)
+                it.setBackground(WHITE)
+        finally:
+            self.tolerance_table.blockSignals(False)
+
+    def _on_main_section_resized(self, logicalIndex, oldSize, newSize):
+        # Подгоняем ширину столбца обоих панелей под основной
+        if logicalIndex < self.tolerance_table.columnCount():
+            self.tolerance_table.setColumnWidth(logicalIndex, newSize)
+        if logicalIndex < self.header_table.columnCount():
+            self.header_table.setColumnWidth(logicalIndex, newSize)
+
+    # ---- UI callbacks ----
+    def build_table(self):
+        cols = max(self.sb_cols.value(), 1)
+        rows = max(self.sb_rows.value(), FIRST_DATA_ROW + 1)
+        try:
+            self.table.blockSignals(True)
+            self.table.setColumnCount(cols)
+            self.table.setRowCount(rows)
+            self.table.clearContents()
+
+            for r in range(rows):
+                for c in range(cols):
+                    it = self.table.item(r, c)
+                    if it is None:
+                        it = QTableWidgetItem("")
+                        self.table.setItem(r, c, it)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setBackground(WHITE)
+
+            # панели: создать столбцы и синхронизировать содержимое
+            self._ensure_hdr_panel_cols()
+            self._ensure_tol_panel_cols()
+
+            # скопировать из основной таблицы
+            self._sync_hdr_from_main()
+            self._sync_tol_from_main()
+
+            # спрятать служебные строки в основной таблице
+            for r in HEADER_ROWS:
+                if r < rows:
+                    self.table.setRowHidden(r, True)
+            if rows > TOL_ROW:
+                self.table.setRowHidden(TOL_ROW, True)
+
+        finally:
+            self.table.blockSignals(False)
+
+    def on_tol_cell_changed(self, row, col):
+        """Пользователь отредактировал допуск в панели — обновим скрытую строку и перекрасим колонку."""
+        if col < 0:
+            return
+        txt = self.tolerance_table.item(0, col).text() if self.tolerance_table.item(0, col) else ""
+        it = self.table.item(TOL_ROW, col)
+        if it is None:
+            it = QTableWidgetItem("")
+            self.table.setItem(TOL_ROW, col, it)
+        try:
+            self.table.blockSignals(True)
+            it.setText(txt)
+            it.setBackground(WHITE)  # допуск — информативный
+        finally:
+            self.table.blockSignals(False)
+        self.recheck_column(col)
+
+    def on_cell_changed(self, row, col):
+        # синхронизация назад, если вдруг пользователь отредактировал скрытые строки в main (через код/загрузку)
+        if row in HEADER_ROWS:
+            # обновим header_panel одну ячейку
+            try:
+                self.header_table.blockSignals(True)
+                idx = HEADER_ROWS.index(row)
+                src = self.table.item(row, col)
+                txt = src.text() if src else ""
+                it = self.header_table.item(idx, col)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.header_table.setItem(idx, col, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt)
+                it.setBackground(WHITE)
+            finally:
+                self.header_table.blockSignals(False)
+            return
+
+        if row == TOL_ROW:
+            try:
+                self.tolerance_table.blockSignals(True)
+                src = self.table.item(TOL_ROW, col)
+                txt = src.text() if src else ""
+                it = self.tolerance_table.item(0, col)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.tolerance_table.setItem(0, col, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt)
+                it.setBackground(WHITE)
+            finally:
+                self.tolerance_table.blockSignals(False)
+            self.recheck_column(col)
+            return
+
+        # обычные ячейки
+        it = self.table.item(row, col)
+        self.recolor_cell(it, row, col)
+
+    # ---- ODS I/O ----
+    def save_to_ods(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить как…", "table.ods", "ODS (*.ods)"
+        )
+        if not path:
+            return
+
+        doc = OpenDocumentSpreadsheet()
+
+        style_green = Style(name="bgGreen", family="table-cell")
+        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
+        doc.automaticstyles.addElement(style_green)
+
+        style_red = Style(name="bgRed", family="table-cell")
+        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
+        doc.automaticstyles.addElement(style_red)
+
+        style_blue = Style(name="bgBlue", family="table-cell")
+        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
+        doc.automaticstyles.addElement(style_blue)
+
+        style_white = None  # default
+
+        t = Table(name="Sheet1")
+        doc.spreadsheet.addElement(t)
+
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+
+        for r in range(rows):
+            tr = TableRow()
+            t.addElement(tr)
+            for c in range(cols):
+                it = self.table.item(r, c)
+                text = it.text() if it else ""
+                bg = it.background().color() if it else WHITE
+
+                if bg == GREEN:
+                    stylename = style_green
+                elif bg == RED:
+                    stylename = style_red
+                elif bg == BLUE:
+                    stylename = style_blue
+                else:
+                    stylename = style_white
+
+                f = try_parse_float(text)
+                if f is not None:
+                    cell = TableCell(valuetype="float", value=f, stylename=stylename)
+                    cell.addElement(P(text=str(f)))
+                else:
+                    cell = TableCell(valuetype="string", stylename=stylename)
+                    cell.addElement(P(text=text))
+                tr.addElement(cell)
+
+        doc.save(path)
+        self.btn_save.setText("Сохранено ✓")
+
+    def open_ods(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "ODS (*.ods)")
+        if not path:
+            return
+
+        doc = load(path)
+        tables = doc.spreadsheet.getElementsByType(Table)
+        if not tables:
+            return
+        sheet = tables[0]
+
+        content_rows, content_cols = _sheet_content_bounds(sheet)
+        if content_rows == 0 or content_cols == 0:
+            try:
+                self.table.blockSignals(True)
+                self.table.setUpdatesEnabled(False)
+                self.table.clearContents()
+                self.table.setRowCount(1)
+                self.table.setColumnCount(1)
+                self.sb_rows.setValue(1)
+                self.sb_cols.setValue(1)
+                it = QTableWidgetItem("")
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setBackground(WHITE)
+                self.table.setItem(0, 0, it)
+            finally:
+                self.table.setUpdatesEnabled(True)
+                self.table.blockSignals(False)
+            return
+
+        est_cells = content_rows * content_cols
+        truncated = est_cells > MAX_CELLS
+        use_cols = content_cols
+        use_rows = content_rows if not truncated else max(1, MAX_CELLS // max(1, use_cols))
+
+        try:
+            self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+
+            self.table.clearContents()
+            final_rows = max(use_rows, FIRST_DATA_ROW + 1)
+            self.table.setRowCount(final_rows)
+            self.table.setColumnCount(use_cols)
+            self.sb_rows.setValue(final_rows)
+            self.sb_cols.setValue(use_cols)
+
+            row_idx = 0
+            for row in sheet.getElementsByType(TableRow):
+                if row_idx >= use_rows:
+                    break
+                rrep = int(row.getAttribute('numberrowsrepeated') or 1)
+
+                # Build a visible template up to use_cols
+                template = []
+                col_idx = 0
+                for cell in row.getElementsByType(TableCell):
+                    crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
+                    vis = min(crep, max(0, use_cols - col_idx))
+                    if vis > 0:
+                        text = _extract_text_from_cell(cell)
+                        template.append((text, vis))
+                    col_idx += crep
+                    if col_idx >= use_cols:
+                        break
+
+                for _ in range(rrep):
+                    if row_idx >= use_rows:
+                        break
+                    c = 0
+                    for text, vis in template:
+                        for _k in range(vis):
+                            it = self.table.item(row_idx, c)
+                            if it is None:
+                                it = QTableWidgetItem("")
+                                self.table.setItem(row_idx, c, it)
+                            it.setTextAlignment(Qt.AlignCenter)
+                            it.setText(text)
+                            # раскрасим по новой логике
+                            self.recolor_cell(it, row_idx, c)
+                            c += 1
+                            if c >= use_cols:
+                                break
+                        if c >= use_cols:
+                            break
+                    row_idx += 1
+
+            # Fill remaining rows (если расширили вниз)
+            for r in range(use_rows, final_rows):
+                for c in range(use_cols):
+                    it = self.table.item(r, c)
+                    if it is None:
+                        it = QTableWidgetItem("")
+                        self.table.setItem(r, c, it)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setBackground(WHITE)
+
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.blockSignals(False)
+
+        # обновить панели из основной таблицы
+        self._ensure_hdr_panel_cols()
+        self._ensure_tol_panel_cols()
+        self._sync_hdr_from_main()
+        self._sync_tol_from_main()
+
+        # прячем служебные строки
+        if self.table.rowCount() > TOL_ROW:
+            self.table.setRowHidden(TOL_ROW, True)
+        for r in HEADER_ROWS:
+            if r < self.table.rowCount():
+                self.table.setRowHidden(r, True)
+
+        if truncated:
+            QMessageBox.information(
+                self,
+                "Файл урезан",
+                f"Загружено {use_rows}×{use_cols} из {content_rows}×{content_cols} "
+                f"(лимит ≈ {MAX_CELLS:,} ячеек)."
+            )
+
+
+def main():
+    app = QApplication(sys.argv)
+    w = MiniOdsEditor()
+    w.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
