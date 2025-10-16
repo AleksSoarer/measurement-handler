@@ -41,6 +41,15 @@ def has_letters(s: str) -> bool:
 def has_digits(s: str) -> bool:
     return any(ch.isdigit() for ch in (s or ""))
 
+def _fmt_serial(s: str) -> str:
+    """Вернуть '283' вместо '283.0' (и '283,0'). Остальное — без изменений."""
+    f = try_parse_float(s)
+    if f is not None:
+        i = int(round(f))
+        if abs(f - i) < 1e-9:
+            return str(i)
+    return s or ""
+
 def try_parse_float(s: str):
     if s is None:
         return None
@@ -96,6 +105,12 @@ def _sheet_content_bounds(sheet: Table):
             content_cols = max(content_cols, last_col_in_row + 1)
     return content_rows, content_cols
 
+def _sync_left_caption_height(self):
+    # высота первой «рабочей» строки в правой таблице
+    if self.table.rowCount() > FIRST_DATA_ROW:
+        h = self.table.rowHeight(FIRST_DATA_ROW)
+        self.info_main_caption.setFixedHeight(h)
+
 
 class MiniOdsEditor(QWidget):
     def __init__(self):
@@ -149,6 +164,8 @@ class MiniOdsEditor(QWidget):
 
         # ======= CENTER AREA: left fixed main info + right main =======
         center = QHBoxLayout()
+        #center.setSpacing(0)                       # <-- добавь
+        #center.setContentsMargins(0, 0, 0, 0)      # <-- добавь
         root.addLayout(center, stretch=1)
 
         # left main info (col0 for all rows, except hidden 1,2,5 — мы их тоже скрываем здесь)
@@ -167,17 +184,22 @@ class MiniOdsEditor(QWidget):
         cap_item = QTableWidgetItem("Серийный номер")
         cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.info_main_caption.setItem(0, 0, cap_item)
+        self.info_main_caption.setFrameStyle(QFrame.NoFrame)
+        self.info_main_caption.setShowGrid(False)
+
         self.info_main_caption.setStyleSheet(
             "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
         )
-        self.info_main_caption.setFrameStyle(QFrame.NoFrame)     # без рамки
-        self.info_main_caption.setShowGrid(False)
-       
 
         # RIGHT side: vertical stack of header + tolerance + main
         right_stack = QVBoxLayout()
         # Для левой части создаём такую же «стек»-колонку
         left_stack = QVBoxLayout()
+
+        # нет промежутков и полей — полосы «прилипают»
+        for lay in (left_stack, right_stack):
+            lay.setSpacing(0)
+            lay.setContentsMargins(0, 0, 0, 0)
 
         # LEFT stack widgets
         left_stack.addWidget(self.info_header_table)
@@ -195,19 +217,24 @@ class MiniOdsEditor(QWidget):
         right_sep1 = QFrame(); right_sep1.setFrameShape(QFrame.HLine); right_sep1.setFrameShadow(QFrame.Sunken)
         right_stack.addWidget(right_sep1)
         right_stack.addWidget(self.tolerance_table)
+        # --- Полоса нумерации столбцов (пристыкована к main-таблице) ---
         self.order_table = QTableWidget(1, 0, self)
         self._setup_top_table(self.order_table, height=34, font_inc=0.0)
-        self.order_table.setFrameStyle(QFrame.NoFrame)          # без рамки
-        self.order_table.setStyleSheet("QTableWidget::item { background: white; }")
+        self.order_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff) 
+        self.order_table.setFrameStyle(QFrame.NoFrame)
+        self.order_table.setShowGrid(False)
+        self.order_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
         right_stack.addWidget(self.order_table)
-        right_sep2 = QFrame(); right_sep2.setFrameShape(QFrame.HLine); right_sep2.setFrameShadow(QFrame.Sunken)
-        right_stack.addWidget(right_sep2)
+        #self._sync_left_caption_height()
+        #right_sep2 = QFrame(); right_sep2.setFrameShape(QFrame.HLine); right_sep2.setFrameShadow(QFrame.Sunken)
+        #right_stack.addWidget(right_sep2)
 
         # MAIN table
         self.table = QTableWidget(0, 0, self)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setVisible(False) 
         self.table.cellChanged.connect(self.on_cell_changed)
         right_stack.addWidget(self.table)
 
@@ -223,11 +250,13 @@ class MiniOdsEditor(QWidget):
         # --- Sync scrollbars & sizes ---
         # Horizontal: sync center header/tolerance with main
         self.table.horizontalScrollBar().valueChanged.connect(self.header_table.horizontalScrollBar().setValue)
-        self.order_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
-        self.table.horizontalScrollBar().valueChanged.connect(self.order_table.horizontalScrollBar().setValue)
         self.table.horizontalScrollBar().valueChanged.connect(self.tolerance_table.horizontalScrollBar().setValue)
-        self.header_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
-        self.tolerance_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+        #self.header_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+        #self.tolerance_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+        # Горизонтальный скролл: main <-> order_row
+        self.table.horizontalScrollBar().valueChanged.connect(self.order_table.horizontalScrollBar().setValue)
+        self.order_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+
         # Vertical: sync left main info with main
         self.table.verticalScrollBar().valueChanged.connect(self.info_main_table.verticalScrollBar().setValue)
         self.info_main_table.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
@@ -255,8 +284,6 @@ class MiniOdsEditor(QWidget):
 
         # Init
         self.build_table()
-        self._sync_left_caption_height()
-
 
     # ---------- UI setup helpers ----------
     def _apply_service_row_visibility(self):
@@ -281,6 +308,11 @@ class MiniOdsEditor(QWidget):
         tw.setStyleSheet("QTableWidget::item { padding: 6px; }")
         tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
         tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # вот эти две строки обеспечат отсутствие полос и колёсика
+        tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
         tw.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
 
     def _setup_left_fixed_table(self, tw: QTableWidget, height: int):
@@ -428,10 +460,9 @@ class MiniOdsEditor(QWidget):
         for r in range(min(rows, FIRST_DATA_ROW)):
             self.info_main_table.setRowHidden(r, True)
         
-        self._sync_order_row()
-        
         # left header & tol fixed tables – ширина колонки уже задана, высоты держим = панелям
         # ничего дополнительно делать не нужно здесь
+        self._sync_order_row()
 
     def _sync_header_from_main(self):
         self.header_table.blockSignals(True)
@@ -459,52 +490,43 @@ class MiniOdsEditor(QWidget):
         self.info_header_table.blockSignals(False)
 
     def _sync_order_row(self):
-        """Обновить 1-based нумерацию колонок в полосе order_table."""
+        """Обновить 1-based нумерацию колонок в полосе order_table и подогнать ширины."""
         cols = self.table.columnCount()
+
+        # кол-во колонок и ячейки
         if self.order_table.columnCount() != cols:
             self.order_table.blockSignals(True)
             self.order_table.setColumnCount(cols)
-            # создать ячейки и скрыть col0 (описание)
             for c in range(cols):
                 it = self.order_table.item(0, c)
                 if it is None:
                     it = QTableWidgetItem("")
                     self.order_table.setItem(0, c, it)
-                it.setTextAlignment(Qt.AlignCenter)
+                self.order_table.item(0, c).setTextAlignment(Qt.AlignCenter)
             self.order_table.blockSignals(False)
 
-        # ширины подгоняем под основную таблицу
+        # ширины как у основной таблицы
         for c in range(cols):
             self.order_table.setColumnWidth(c, self.table.columnWidth(c))
 
-        # col0 не считаем — скрываем
+        # 0-й столбец – описательный: скрываем и НЕ нумеруем
         if cols > 0:
             self.order_table.setColumnHidden(0, True)
 
-        # заполняем 1-based метки для c >= 1
+        # проставить метки 1..N-1 для c >= 1
         self.order_table.blockSignals(True)
         for c in range(cols):
             it = self.order_table.item(0, c)
             if it is None:
                 it = QTableWidgetItem("")
                 self.order_table.setItem(0, c, it)
-            if c == 0:
-                it.setText("")               # описание — пусто
-            else:
-                it.setText(str(c))           # 1-based (col=1 -> "1")
-            it.setBackground(WHITE)          # никогда не красим
+            it.setBackground(WHITE)       # никогда не красим
+            it.setText("" if c == 0 else str(c))  # тут и есть нумерация с 1
         self.order_table.blockSignals(False)
-        self._sync_left_caption_height()
 
-    def _sync_left_caption_height(self):
-        """Делаем левый «Серийный номер» той же высоты, что и полоса нумерации справа."""
-        # если order_table уже создан/настроен — берём её высоту
-        if hasattr(self, "order_table"):
-            self.info_main_caption.setFixedHeight(self.order_table.height())
-        else:
-            # запасной вариант — как высота первой рабочей строки данных
-            if self.table.rowCount() > FIRST_DATA_ROW:
-                self.info_main_caption.setFixedHeight(self.table.rowHeight(FIRST_DATA_ROW))
+        # 
+        self._sync_order_and_caption_height()
+
     
     def on_hdr_cell_changed(self, row, col):
         """
@@ -577,7 +599,8 @@ class MiniOdsEditor(QWidget):
             if it is None:
                 it = QTableWidgetItem(""); self.info_main_table.setItem(r, 0, it)
             it.setText(txt)
-        self.info_main_table.blockSignals(False)
+        #self.info_main_table.blockSignals(False)
+        self.info_main_table.item(r, 0).setText(_fmt_serial(txt))
 
     def _on_main_section_resized(self, logicalIndex, oldSize, newSize):
         if logicalIndex < self.tolerance_table.columnCount():
@@ -585,14 +608,12 @@ class MiniOdsEditor(QWidget):
         if logicalIndex < self.header_table.columnCount():
             self.header_table.setColumnWidth(logicalIndex, newSize)
         if logicalIndex < self.order_table.columnCount():
-            self.order_table.setColumnWidth(logicalIndex, newSize) 
+            self.order_table.setColumnWidth(logicalIndex, newSize)
 
     def _on_main_row_height_changed(self, logicalIndex, oldSize, newSize):
         if 0 <= logicalIndex < self.info_main_table.rowCount():
             self.info_main_table.setRowHeight(logicalIndex, newSize)
-        # если меняется высота первой рабочей строки — обновим «шапку» слева
-        if logicalIndex == FIRST_DATA_ROW:
-            self.info_main_caption.setFixedHeight(newSize)
+        self._sync_order_and_caption_height()
 
     def on_info_header_cell_changed(self, row, col):
         main_row = HEADER_ROWS[row]
@@ -618,8 +639,11 @@ class MiniOdsEditor(QWidget):
             self.table.blockSignals(False)
 
     def on_info_main_cell_changed(self, row, col):
-        txt = self.info_main_table.item(row, col).text() if self.info_main_table.item(row, col) else ""
+        raw = self.info_main_table.item(row, col).text() if self.info_main_table.item(row, col) else ""
+        txt = _fmt_serial(raw)
         it = self.table.item(row, 0)
+        # обновляем левый виджет (на случай, если пользователь ввёл 283.0)
+        self.info_main_table.item(row, 0).setText(txt)
         if it is None:
             it = QTableWidgetItem(""); self.table.setItem(row, 0, it)
         try:
@@ -627,6 +651,21 @@ class MiniOdsEditor(QWidget):
             it.setText(txt); it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
+
+    def _sync_order_and_caption_height(self):
+        """Высота полосы нумерации и левой подписи = высоте первой рабочей строки."""
+        # высота первой рабочей строки (после служебных)
+        if self.table.rowCount() > FIRST_DATA_ROW:
+            h = self.table.rowHeight(FIRST_DATA_ROW)
+        else:
+            h = max(28, self.order_table.rowHeight(0))
+
+        # полоса нумерации
+        self.order_table.setRowHeight(0, h)
+        self.order_table.setFixedHeight(h)  # без рамок достаточно ровно h
+
+        # левая подпись «Серийный номер»
+        self.info_main_caption.setFixedHeight(h)
 
     # ---------- UI callbacks ----------
     def build_table(self):
@@ -654,12 +693,12 @@ class MiniOdsEditor(QWidget):
             if rows > TOL_ROW:
                 self.table.setRowHidden(TOL_ROW, True)
 
-            
+
             """
-            self._apply_service_row_visibility()
             # скрываем колонку 0 в main — её показывают левые таблицы
             if cols > 0:
                 self.table.setColumnHidden(0, True)
+            self._apply_service_row_visibility()
 
             # выровнять панели/левые таблицы и залить данными
             self._ensure_panel_cols()
@@ -670,6 +709,8 @@ class MiniOdsEditor(QWidget):
 
         finally:
             self.table.blockSignals(False)
+            self.table.horizontalScrollBar().setValue(0)
+            self.order_table.horizontalScrollBar().setValue(0)
 
     def on_tol_cell_changed(self, row, col):
         if col < 0: return
@@ -727,7 +768,7 @@ class MiniOdsEditor(QWidget):
         style_white = None  # default
 
         t = Table(name="Sheet1"); doc.spreadsheet.addElement(t)
-
+        
         rows = self.table.rowCount(); cols = self.table.columnCount()
         for r in range(rows):
             tr = TableRow(); t.addElement(tr)
@@ -743,11 +784,18 @@ class MiniOdsEditor(QWidget):
 
                 f = try_parse_float(text)
                 if f is not None:
-                    cell = TableCell(valuetype="float", value=f, stylename=stylename)
-                    cell.addElement(P(text=str(f)))
+                    if c == 0 and abs(f - int(round(f))) < 1e-9:
+                        ival = int(round(f))
+                        cell = TableCell(valuetype="float", value=ival, stylename=stylename)
+                        cell.addElement(P(text=str(ival)))
+                    else:
+                        cell = TableCell(valuetype="float", value=f, stylename=stylename)
+                        cell.addElement(P(text=str(f)))
                 else:
+                    # для строки в первом столбце тоже подчистим внешний вид
+                    txt = _fmt_serial(text) if c == 0 else text
                     cell = TableCell(valuetype="string", stylename=stylename)
-                    cell.addElement(P(text=text))
+                    cell.addElement(P(text=txt))
                 tr.addElement(cell)
 
         doc.save(path)
@@ -785,7 +833,6 @@ class MiniOdsEditor(QWidget):
             final_rows = max(use_rows, FIRST_DATA_ROW + 1)
             self.table.setRowCount(final_rows); self.table.setColumnCount(use_cols)
             self.sb_rows.setValue(final_rows); self.sb_cols.setValue(use_cols)
-            self._sync_order_row()
 
             row_idx = 0
             for row in sheet.getElementsByType(TableRow):
@@ -812,7 +859,8 @@ class MiniOdsEditor(QWidget):
                             if it is None:
                                 it = QTableWidgetItem(""); self.table.setItem(row_idx, c, it)
                             it.setTextAlignment(Qt.AlignCenter)
-                            it.setText(text)
+                            text_to_set = _fmt_serial(text) if c == 0 else text
+                            it.setText(text_to_set)
                             self.recolor_cell(it, row_idx, c)
                             c += 1
                             if c >= use_cols: break
@@ -848,7 +896,10 @@ class MiniOdsEditor(QWidget):
         self._sync_header_from_main()
         self._sync_tol_from_main()
         self._sync_info_main_from_main()
-        self._sync_left_caption_height()
+        self._sync_order_row()
+        # чтобы нумерация начиналась с 1 на экране
+        self.table.horizontalScrollBar().setValue(0)
+        self.order_table.horizontalScrollBar().setValue(0)
 
         if truncated:
             QMessageBox.information(
