@@ -154,10 +154,10 @@ class MiniOdsEditor(QWidget):
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
 
-        self.btnExportMerged = QPushButton("PDF: внешний + таблица")
-        self.btnExportMerged.setToolTip("Сначала выбранный внешний PDF, потом текущая таблица одним листом")
-        self.btnExportMerged.clicked.connect(self.export_pdf_with_prefix)
-        ctrl.addWidget(self.btnExportMerged)
+        self.btn_export_merged = QPushButton("PDF: внешний + таблица")
+        self.btn_export_merged.setToolTip("Склеить: сначала выбранный PDF, затем вся таблица одним листом")
+        self.btn_export_merged.clicked.connect(self.export_pdf_with_prefix)
+        ctrl.addWidget(self.btn_export_merged)
 
         ctrl.addStretch()
         root.addLayout(ctrl)
@@ -697,41 +697,43 @@ class MiniOdsEditor(QWidget):
 
         return _restore
 
+    
     def export_pdf_with_prefix(self):
-        # 1) внешний PDF
-        in_path, _ = QFileDialog.getOpenFileName(
-            self, "Выбери внешний PDF (пойдёт первым)", "", "PDF Files (*.pdf)"
-        )
+        """
+        Новый вариант: [входной PDF (все страницы)] + [ВЕСЬ self.table одной страницей].
+        Никаких панелей/капшенов — только «плоская» таблица, как в ODS.
+        """
+        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери внешний PDF", "", "PDF Files (*.pdf)")
         if not in_path:
             return
 
-        # 2) куда сохранить результат
-        out_path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить как...", "merged.pdf", "PDF Files (*.pdf)"
-        )
+        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "merged.pdf", "PDF Files (*.pdf)")
         if not out_path:
             return
 
-        # 3) печатаем наш отчёт-панель (как виден на экране) в временный PDF
-        fd, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+        # 1) соберём плоскую копию всей таблицы (все строки/столбцы, с цветами)
+        flat = self._build_full_table_snapshot()
+
+        # 2) распечатаем ЕЁ на один лист во временный PDF
+        fd, tmp_pdf = tempfile.mkstemp(suffix=".pdf")
         os.close(fd)
         try:
-            self._print_widget_to_single_pdf(tmp_pdf_path, self.report_panel)
+            self._print_table_to_single_pdf(tmp_pdf, flat)
 
-            # 4) склейка: [внешний.pdf] + [наш tmp_pdf]
+            # 3) склейка: сначала входной, потом наш лист
             writer = PdfWriter()
 
             r1 = PdfReader(in_path)
             if getattr(r1, "is_encrypted", False):
                 try:
-                    r1.decrypt("")  # вдруг пустой пароль
+                    r1.decrypt("")
                 except Exception:
-                    QMessageBox.warning(self, "Ошибка", "Входной PDF зашифрован. Сними защиту и попробуй снова.")
+                    QMessageBox.warning(self, "Ошибка", "Входной PDF зашифрован.")
                     return
             for p in r1.pages:
                 writer.add_page(p)
 
-            r2 = PdfReader(tmp_pdf_path)
+            r2 = PdfReader(tmp_pdf)
             for p in r2.pages:
                 writer.add_page(p)
 
@@ -743,8 +745,212 @@ class MiniOdsEditor(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Провал", f"Не удалось собрать PDF:\n{e}")
         finally:
-            try: os.remove(tmp_pdf_path)
-            except Exception: pass
+            try:
+                os.remove(tmp_pdf)
+            except Exception:
+                pass
+            # не забываем удалить временный виджет
+            flat.deleteLater()
+
+
+    def _build_full_table_snapshot(self) -> QTableWidget:
+        """
+        Делаем ПОЛНУЮ копию self.table:
+        - все строки (включая служебные 3,4,5),
+        - все столбцы (включая 0-й),
+        - те же тексты/заливки/цвет шрифта/выравнивания,
+        - ширины/высоты как на экране (для колонки 0 ставим INFO_COL_WIDTH).
+        Никаких скрытий.
+        """
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+        tw = QTableWidget(rows, cols, self)
+
+        tw.verticalHeader().setVisible(False)
+        tw.horizontalHeader().setVisible(False)
+        tw.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        # ширины колонок
+        for c in range(cols):
+            w = self.table.columnWidth(c)
+            if c == 0:
+                w = max(w, INFO_COL_WIDTH)  # 0-й на экране скрыт, зададим нормальную ширину
+            tw.setColumnWidth(c, max(1, w))
+
+        # высоты строк
+        for r in range(rows):
+            h = self.table.rowHeight(r)
+            tw.setRowHeight(r, max(1, h))
+
+        # контент + цвета
+        for r in range(rows):
+            for c in range(cols):
+                src = self.table.item(r, c)
+                txt = src.text() if src else ""
+                it = QTableWidgetItem(txt)
+                if src:
+                    it.setBackground(src.background())
+                    it.setForeground(src.foreground())
+                    it.setTextAlignment(src.textAlignment())
+                else:
+                    it.setTextAlignment(Qt.AlignCenter)
+                tw.setItem(r, c, it)
+
+        # ничего не скрываем
+        for r in range(rows):
+            tw.setRowHidden(r, False)
+        for c in range(cols):
+            tw.setColumnHidden(c, False)
+
+        return tw
+
+
+    def _print_table_to_single_pdf(self, pdf_path, table: QTableWidget):
+        """
+        Печать QTableWidget на ОДИН лист с масштабированием по большей стороне.
+        Печатаем ВСЕ содержимое (без полос прокрутки).
+        """
+        vh = table.verticalHeader()
+        hh = table.horizontalHeader()
+        fw = table.frameWidth() * 2
+
+        content_w = int(fw + vh.width() + sum(table.columnWidth(c) for c in range(table.columnCount())))
+        content_h = int(fw + hh.height() + sum(table.rowHeight(r) for r in range(table.rowCount())))
+        if content_w <= 0 or content_h <= 0:
+            raise RuntimeError("Таблица пуста — печатать нечего.")
+
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setResolution(300)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(pdf_path)
+        printer.setPaperSize(QPrinter.A4)
+        printer.setFullPage(True)
+        printer.setOrientation(QPrinter.Landscape if content_w >= content_h else QPrinter.Portrait)
+
+        painter = QPainter(printer)
+        if not painter.isActive():
+            raise RuntimeError("Не удалось активировать QPainter для печати PDF")
+
+        target = printer.pageRect(QPrinter.DevicePixel)
+
+        old_size = table.size()
+        old_hpol = table.horizontalScrollBarPolicy()
+        old_vpol = table.verticalScrollBarPolicy()
+
+        try:
+            table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            table.resize(content_w, content_h)
+            QApplication.processEvents()
+
+            sx = target.width() / float(content_w)
+            sy = target.height() / float(content_h)
+            scale = min(sx, sy)
+
+            view_w = max(1, int(content_w * scale))
+            view_h = max(1, int(content_h * scale))
+            offset_x = int((target.width() - view_w) / 2)
+            offset_y = int((target.height() - view_h) / 2)
+
+            painter.setViewport(QRect(offset_x, offset_y, view_w, view_h))
+            painter.setWindow(QRect(0, 0, int(content_w), int(content_h)))
+
+            table.render(painter, flags=QWidget.DrawChildren)
+        finally:
+            painter.end()
+            table.resize(old_size)
+            table.setHorizontalScrollBarPolicy(old_hpol)
+            table.setVerticalScrollBarPolicy(old_vpol)
+
+
+   
+
+
+    def _expand_children_for_print(self, root_widget):
+        """Убираем скроллы и растягиваем виджеты, чтобы в PDF попал весь контент."""
+        saved = []
+
+        # Таблицы (QTableWidget/QTableView)
+        for tv in root_widget.findChildren(QTableView):
+            st = {
+                "w": tv,
+                "size": tv.size(),
+                "hpol": tv.horizontalScrollBarPolicy(),
+                "vpol": tv.verticalScrollBarPolicy(),
+            }
+            saved.append(st)
+            try:
+                tv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                tv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                tv.resizeColumnsToContents()
+                tv.resizeRowsToContents()
+
+                vh = tv.verticalHeader(); hh = tv.horizontalHeader()
+                fw = tv.frameWidth() * 2
+                total_w = fw + vh.width() + sum(tv.columnWidth(c) for c in range(tv.model().columnCount()))
+                total_h = fw + hh.height() + sum(tv.rowHeight(r) for r in range(tv.model().rowCount()))
+                tv.resize(max(1, total_w), max(1, total_h))
+            except Exception:
+                pass
+
+        # Списки
+        for lv in root_widget.findChildren(QListView):
+            st = {
+                "w": lv,
+                "size": lv.size(),
+                "hpol": lv.horizontalScrollBarPolicy(),
+                "vpol": lv.verticalScrollBarPolicy(),
+            }
+            saved.append(st)
+            try:
+                lv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                lv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                m = lv.model()
+                rows = m.rowCount() if m is not None else 0
+                base_h = lv.sizeHintForRow(0) if rows > 0 else lv.fontMetrics().height() + 6
+                total_h = lv.frameWidth()*2 + base_h*max(1, rows)
+                total_w = max(lv.width(), lv.viewport().sizeHint().width() + lv.frameWidth()*2)
+                lv.resize(max(1, total_w), max(1, total_h))
+            except Exception:
+                pass
+
+        # Скролл-области
+        for sa in root_widget.findChildren(QScrollArea):
+            inner = sa.widget()
+            st = {
+                "w": sa,
+                "size": sa.size(),
+                "hpol": sa.horizontalScrollBarPolicy(),
+                "vpol": sa.verticalScrollBarPolicy(),
+                "inner_size": inner.size() if inner else None,
+            }
+            saved.append(st)
+            try:
+                sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                sa.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                if inner:
+                    inner.adjustSize()
+                    inner.resize(inner.sizeHint())
+                    sa.resize(inner.width() + sa.frameWidth()*2,
+                            inner.height() + sa.frameWidth()*2)
+            except Exception:
+                pass
+
+        def _restore():
+            for st in saved:
+                w = st["w"]
+                try:
+                    if hasattr(w, "setHorizontalScrollBarPolicy"):
+                        w.setHorizontalScrollBarPolicy(st.get("hpol", Qt.ScrollBarAsNeeded))
+                    if hasattr(w, "setVerticalScrollBarPolicy"):
+                        w.setVerticalScrollBarPolicy(st.get("vpol", Qt.ScrollBarAsNeeded))
+                    w.resize(st["size"])
+                    if isinstance(w, QScrollArea) and st.get("inner_size") and w.widget():
+                        w.widget().resize(st["inner_size"])
+                except Exception:
+                    pass
+
+        return _restore
 
 
     def _row_is_empty_measurements(self, r: int) -> bool:
