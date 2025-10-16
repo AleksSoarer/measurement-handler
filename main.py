@@ -96,6 +96,12 @@ def _sheet_content_bounds(sheet: Table):
             content_cols = max(content_cols, last_col_in_row + 1)
     return content_rows, content_cols
 
+def _sync_left_caption_height(self):
+    # высота первой «рабочей» строки в правой таблице
+    if self.table.rowCount() > FIRST_DATA_ROW:
+        h = self.table.rowHeight(FIRST_DATA_ROW)
+        self.info_main_caption.setFixedHeight(h)
+
 
 class MiniOdsEditor(QWidget):
     def __init__(self):
@@ -405,10 +411,17 @@ class MiniOdsEditor(QWidget):
         # высоты строк и скрытие 1,2,5 для точного совпадения
         for r in range(rows):
             self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
-        for r in HEADER_ROWS + [TOL_ROW]:
-            if r < rows:
-                self.info_main_table.setRowHidden(r, True)
+        #for r in HEADER_ROWS + [TOL_ROW]:
+        #    if r < rows:
+        #        self.info_main_table.setRowHidden(r, True)
 
+        # высоты строк
+        for r in range(rows):
+            self.info_main_table.setRowHeight(r, self.table.rowHeight(r))
+        # скрываем все служебные (0..FIRST_DATA_ROW-1)
+        for r in range(min(rows, FIRST_DATA_ROW)):
+            self.info_main_table.setRowHidden(r, True)
+        
         # left header & tol fixed tables – ширина колонки уже задана, высоты держим = панелям
         # ничего дополнительно делать не нужно здесь
 
@@ -519,6 +532,9 @@ class MiniOdsEditor(QWidget):
     def _on_main_row_height_changed(self, logicalIndex, oldSize, newSize):
         if 0 <= logicalIndex < self.info_main_table.rowCount():
             self.info_main_table.setRowHeight(logicalIndex, newSize)
+        # если меняется высота первой рабочей строки — обновим «шапку» слева
+        if logicalIndex == FIRST_DATA_ROW:
+            self.info_main_caption.setFixedHeight(newSize)
 
     def on_info_header_cell_changed(self, row, col):
         main_row = HEADER_ROWS[row]
@@ -632,15 +648,21 @@ class MiniOdsEditor(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", "table.ods", "ODS (*.ods)")
         if not path: return
 
+
+        #GREEN = QColor("#1A8830")   # soft green
+        #RED   = QColor("#8D1926")   # soft red
+        #BLUE  = QColor("#265C8F")   # kept for backward compat (открытие старых .ods)
+        #WHITE = QColor("#FFFFFF")
+        
         doc = OpenDocumentSpreadsheet()
         style_green = Style(name="bgGreen", family="table-cell")
-        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
+        style_green.addElement(TableCellProperties(backgroundcolor="#1A8830"))
         doc.automaticstyles.addElement(style_green)
         style_red = Style(name="bgRed", family="table-cell")
-        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
+        style_red.addElement(TableCellProperties(backgroundcolor="#8D1926"))
         doc.automaticstyles.addElement(style_red)
         style_blue = Style(name="bgBlue", family="table-cell")
-        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
+        style_blue.addElement(TableCellProperties(backgroundcolor="#265C8F"))
         doc.automaticstyles.addElement(style_blue)
         style_white = None  # default
 
@@ -757,6 +779,9 @@ class MiniOdsEditor(QWidget):
         if self.table.columnCount() > 0:
             self.table.setColumnHidden(0, True)
         """
+        self._apply_service_row_visibility()
+        if self.table.columnCount() > 0:
+            self.table.setColumnHidden(0, True)
         
         self._ensure_panel_cols()
         self._sync_header_from_main()
