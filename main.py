@@ -376,7 +376,7 @@ class MiniOdsEditor(QWidget):
         if (row >= FIRST_DATA_ROW) and (col > 0):
             tol = self._get_tol(col)
             if tol is not None and f is not None:
-                it.setBackground(GREEN if abs(f) <= tol else RED)
+                it.setBackground(BLUE if abs(f) <= tol else RED)
                 return
 
         # fallback
@@ -597,10 +597,10 @@ class MiniOdsEditor(QWidget):
             txt = src.text() if src else ""
             it = self.info_main_table.item(r, 0)
             if it is None:
-                it = QTableWidgetItem(""); self.info_main_table.setItem(r, 0, it)
-            it.setText(txt)
-        #self.info_main_table.blockSignals(False)
-        self.info_main_table.item(r, 0).setText(_fmt_serial(txt))
+                it = QTableWidgetItem("")
+                self.info_main_table.setItem(r, 0, it)
+            it.setText(_fmt_serial(txt))  # показываем целые
+        self.info_main_table.blockSignals(False)
 
     def _on_main_section_resized(self, logicalIndex, oldSize, newSize):
         if logicalIndex < self.tolerance_table.columnCount():
@@ -706,6 +706,7 @@ class MiniOdsEditor(QWidget):
             self._sync_tol_from_main()
             self._sync_info_main_from_main()
             self._sync_order_row()
+            self.recolor_all()
 
         finally:
             self.table.blockSignals(False)
@@ -900,6 +901,7 @@ class MiniOdsEditor(QWidget):
         # чтобы нумерация начиналась с 1 на экране
         self.table.horizontalScrollBar().setValue(0)
         self.order_table.horizontalScrollBar().setValue(0)
+        self.recolor_all()
 
         if truncated:
             QMessageBox.information(
