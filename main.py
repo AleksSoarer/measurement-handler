@@ -1,9 +1,16 @@
 import sys
 import re
+import os
+import tempfile
+from PyQt5.QtPrintSupport import QPrinter
+from PyQt5.QtGui import QPainter
+from pypdf import PdfReader, PdfWriter
+from PyQt5.QtCore import Qt, QRect
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QSpinBox, QPushButton, QTableWidget, QTableWidgetItem, QFileDialog,
-    QMessageBox, QAbstractItemView, QFrame
+    QMessageBox, QAbstractItemView, QFrame,
+    QTableView, QListView, QScrollArea
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -13,9 +20,6 @@ from odf.opendocument import OpenDocumentSpreadsheet, load
 from odf.style import Style, TableCellProperties
 from odf.table import Table, TableRow, TableCell
 from odf.text import P
-
-import os, tempfile, subprocess, shutil
-from pypdf import PdfReader, PdfWriter
 
 # ---- Colors ----
 GREEN = QColor("#1A8830")   # ok data
@@ -149,7 +153,17 @@ class MiniOdsEditor(QWidget):
 
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
-        
+
+        # небольшой визуальный разделитель перед PDF-кнопкой
+        sep = QFrame()
+        sep.setFrameShape(QFrame.VLine)
+        sep.setFrameShadow(QFrame.Sunken)
+        ctrl.addWidget(sep)
+
+        self.btnExportMerged = QPushButton("PDF: внешний + таблица")
+        self.btnExportMerged.setToolTip("Сначала внешний PDF целиком, затем таблица, ужатая на один лист")
+        self.btnExportMerged.clicked.connect(self.export_pdf_with_prefix)
+        ctrl.addWidget(self.btnExportMerged)
 
         ctrl.addStretch()
         root.addLayout(ctrl)
@@ -173,33 +187,11 @@ class MiniOdsEditor(QWidget):
         self._setup_top_table(self.tolerance_table, TOL_PANEL_HEIGHT, font_inc=2.0)
         self.tolerance_table.cellChanged.connect(self.on_tol_cell_changed)
 
-        # ======= CENTER AREA: left fixed main info + right main =======
-        center = QHBoxLayout()
-        #center.setSpacing(0)                       # <-- добавь
-        #center.setContentsMargins(0, 0, 0, 0)      # <-- добавь
-        root.addLayout(center, stretch=1)
 
-        # ==== TOTAL DEFECTS STRIP (отдельное окошко) ====
-        total_bar = QHBoxLayout()
-        total_bar.setContentsMargins(0, 6, 0, 0)
-        total_bar.setSpacing(8)
-
-        lbl_total = QLabel("Итого брак:")
-        lbl_total.setStyleSheet("font-weight:600;")
-        self.total_defects_lbl = QLabel("0")
-        self.total_defects_lbl.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.total_defects_lbl.setStyleSheet("font-weight:700; padding:4px 8px; border:1px solid #ccc; border-radius:6px;")
-
-        total_bar.addStretch(1)
-        total_bar.addWidget(lbl_total)
-        total_bar.addWidget(self.total_defects_lbl)
-        root.addLayout(total_bar)
-
-        # left main info (col0 for all rows, except hidden 1,2,5 — мы их тоже скрываем здесь)
+        # ===== LEFT main widgets =====
         self.info_main_table = QTableWidget(0, 1, self)
         self._setup_left_main_table(self.info_main_table)
 
-        # Заголовок для левого фикс-столбца (залипает) — СОЗДАЁМ ДО добавления в layout
         self.info_main_caption = QTableWidget(1, 1, self)
         self.info_main_caption.verticalHeader().setVisible(False)
         self.info_main_caption.horizontalHeader().setVisible(False)
@@ -207,27 +199,99 @@ class MiniOdsEditor(QWidget):
         self.info_main_caption.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.info_main_caption.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.info_main_caption.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.info_main_caption.setColumnWidth(0, INFO_COL_WIDTH)  # ширина сразу здесь
+        self.info_main_caption.setColumnWidth(0, INFO_COL_WIDTH)
         cap_item = QTableWidgetItem("Серийный/измерение")
         cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.info_main_caption.setItem(0, 0, cap_item)
         self.info_main_caption.setFrameStyle(QFrame.NoFrame)
         self.info_main_caption.setShowGrid(False)
-
         self.info_main_caption.setStyleSheet(
             "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
         )
 
-        # RIGHT side: vertical stack of header + tolerance + main
-        right_stack = QVBoxLayout()
-        # Для левой части создаём такую же «стек»-колонку
-        left_stack = QVBoxLayout()
+        self.info_oos_caption = QTableWidget(1, 1, self)
+        self.info_oos_caption.verticalHeader().setVisible(False)
+        self.info_oos_caption.horizontalHeader().setVisible(False)
+        self.info_oos_caption.setFixedHeight(32)
+        self.info_oos_caption.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.info_oos_caption.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_oos_caption.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_oos_caption.setColumnWidth(0, INFO_COL_WIDTH)
+        oos_cap_item = QTableWidgetItem("Не в допуске")
+        oos_cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.info_oos_caption.setItem(0, 0, oos_cap_item)
+        self.info_oos_caption.setFrameStyle(QFrame.NoFrame)
+        self.info_oos_caption.setShowGrid(False)
+        self.info_oos_caption.setStyleSheet(
+            "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
+        )
 
-        # нет промежутков и полей — полосы «прилипают»
+        # ===== RIGHT main widgets =====
+        self.order_table = QTableWidget(1, 0, self)
+        self._setup_top_table(self.order_table, height=34, font_inc=0.0)
+        self.order_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.order_table.setFrameStyle(QFrame.NoFrame)
+        self.order_table.setShowGrid(False)
+        self.order_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
+
+        self.table = QTableWidget(0, 0, self)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setVisible(False)
+        self.table.cellChanged.connect(self.on_cell_changed)
+
+        self.oos_table = QTableWidget(1, 0, self)
+        self._setup_top_table(self.oos_table, height=34, font_inc=0.0)
+        self.oos_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.oos_table.setFrameStyle(QFrame.NoFrame)
+        self.oos_table.setShowGrid(False)
+        self.oos_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
+
+        # ======= CENTER AREA: left fixed main info + right main =======
+        # Стэки колонок
+        left_stack = QVBoxLayout()
+        right_stack = QVBoxLayout()
         for lay in (left_stack, right_stack):
             lay.setSpacing(0)
             lay.setContentsMargins(0, 0, 0, 0)
 
+        # LEFT
+        left_stack.addWidget(self.info_header_table)
+        left_sep1 = QFrame(); left_sep1.setFrameShape(QFrame.HLine); left_sep1.setFrameShadow(QFrame.Sunken)
+        left_stack.addWidget(left_sep1)
+        left_stack.addWidget(self.info_tol_table)
+        left_sep2 = QFrame(); left_sep2.setFrameShape(QFrame.HLine); left_sep2.setFrameShadow(QFrame.Sunken)
+        left_stack.addWidget(left_sep2)
+        left_stack.addWidget(self.info_main_caption)
+        left_stack.addWidget(self.info_main_table)
+        left_stack.addWidget(self.info_oos_caption)
+
+        # RIGHT
+        right_stack.addWidget(self.header_table)
+        right_sep1 = QFrame(); right_sep1.setFrameShape(QFrame.HLine); right_sep1.setFrameShadow(QFrame.Sunken)
+        right_stack.addWidget(right_sep1)
+        right_stack.addWidget(self.tolerance_table)
+        right_stack.addWidget(self.order_table)
+        right_stack.addWidget(self.table, 1)
+        right_stack.addWidget(self.oos_table)
+
+        left_container = QWidget(); left_container.setLayout(left_stack)
+        right_container = QWidget(); right_container.setLayout(right_stack)
+
+        self.report_panel = QWidget()
+        rep_layout = QHBoxLayout(self.report_panel)
+        rep_layout.setContentsMargins(12, 12, 12, 12)
+        rep_layout.setSpacing(12)
+        rep_layout.addWidget(left_container)
+        sep_mid = QFrame(); sep_mid.setFrameShape(QFrame.VLine); sep_mid.setFrameShadow(QFrame.Sunken)
+        rep_layout.addWidget(sep_mid)
+        rep_layout.addWidget(right_container, 1)
+
+        root.addWidget(self.report_panel, 1)
+
+
+        """
                 # подпись для нижней строки ("Не в допуске")
         self.info_oos_caption = QTableWidget(1, 1, self)
         self.info_oos_caption.verticalHeader().setVisible(False)
@@ -245,6 +309,8 @@ class MiniOdsEditor(QWidget):
         self.info_oos_caption.setStyleSheet(
             "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
         )
+
+
 
         # полоса счётчиков "Не в допуске" под основной таблицей
         self.oos_table = QTableWidget(1, 0, self)
@@ -283,7 +349,7 @@ class MiniOdsEditor(QWidget):
         #self._sync_left_caption_height()
         #right_sep2 = QFrame(); right_sep2.setFrameShape(QFrame.HLine); right_sep2.setFrameShadow(QFrame.Sunken)
         #right_stack.addWidget(right_sep2)
-
+        """
 
         # MAIN table
         self.table = QTableWidget(0, 0, self)
@@ -298,13 +364,26 @@ class MiniOdsEditor(QWidget):
 
     
         # put into center
-        left_container = QWidget(); left_container.setLayout(left_stack)
-        right_container = QWidget(); right_container.setLayout(right_stack)
+        #left_container = QWidget(); left_container.setLayout(left_stack)
+        #right_container = QWidget(); right_container.setLayout(right_stack)
         center.addWidget(left_container)
         # thin vertical separator
         sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
         center.addWidget(sep)
         center.addWidget(right_container, stretch=1)
+
+        self.report_panel = QWidget()
+        rep_layout = QHBoxLayout(self.report_panel)
+        rep_layout.setContentsMargins(12, 12, 12, 12)
+        rep_layout.setSpacing(12)
+
+        rep_layout.addWidget(left_container)
+        sep_mid = QFrame(); sep_mid.setFrameShape(QFrame.VLine); sep_mid.setFrameShadow(QFrame.Sunken)
+        rep_layout.addWidget(sep_mid)
+        rep_layout.addWidget(right_container, 1)
+
+        # Добавляем ЕЁ (а не отдельные куски) в корневой лэйаут
+        root.addWidget(self.report_panel, 1)
 
 
 
@@ -538,15 +617,6 @@ class MiniOdsEditor(QWidget):
         # если значений не было вообще — пустая строка => брак
         return not has_any_value
     
-    def _row_is_empty_measurements(self, r: int) -> bool:
-        cols = self.table.columnCount()
-        if r < FIRST_DATA_ROW or cols <= 1:
-            return True
-        for c in range(1, cols):
-            it = self.table.item(r, c)
-            if it and (it.text() or "").strip():
-                return False
-        return True
     
     def _row_is_empty_measurements(self, r: int) -> bool:
         """True, если во всех ячейках c>=1 пусто (игнорируем служебные строки)."""
@@ -1213,6 +1283,284 @@ class MiniOdsEditor(QWidget):
                 f"Загружено {use_rows}×{use_cols} из {content_rows}×{content_cols} "
                 f"(лимит ≈ {MAX_CELLS:,} ячеек)."
             )
+
+    def export_pdf_with_prefix(self):
+        """Открывает внешний PDF и сохраняет новый:
+        [внешний.pdf (все страницы)] + [таблица на 1 листе]."""
+        # 1) выбрать внешний PDF
+        in_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Выбери внешний PDF (пойдёт в начало)",
+            "",
+            "PDF Files (*.pdf)"
+        )
+        if not in_path:
+            return
+
+        # 2) куда сохранить результат
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить как...",
+            "merged.pdf",
+            "PDF Files (*.pdf)"
+        )
+        if not out_path:
+            return
+
+        # 3) временно печатаем таблицу в отдельный PDF-файл
+        tmp_fd, tmp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(tmp_fd)  # только путь нужен
+
+        try:
+            self._print_widget_to_single_pdf(tmp_pdf_path, self.report_panel)
+
+            # 4) склейка
+            writer = PdfWriter()
+
+            # внешний PDF (идёт первым)
+            r1 = PdfReader(in_path)
+            if getattr(r1, "is_encrypted", False):
+                try:
+                    r1.decrypt("")  # вдруг пустой пароль
+                except Exception:
+                    QMessageBox.warning(
+                        self,
+                        "Ошибка",
+                        "Входной PDF зашифрован. Сними защиту и попробуй снова."
+                    )
+                    return
+            for p in r1.pages:
+                writer.add_page(p)
+
+            # затем страница с таблицей
+            r2 = PdfReader(tmp_pdf_path)
+            for p in r2.pages:
+                writer.add_page(p)
+
+            # 5) сохранить
+            with open(out_path, "wb") as f:
+                writer.write(f)
+
+            QMessageBox.information(self, "Готово", f"PDF сохранён:\n{out_path}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Провал", f"Не удалось собрать PDF:\n{e}")
+        finally:
+            # прибраться за собой, как взрослые люди не делают, но мы сделаем
+            try:
+                os.remove(tmp_pdf_path)
+            except Exception:
+                pass
+
+    def _print_widget_to_single_pdf(self, pdf_path, widget):
+        """Печатает ЛЮБОЙ контейнер (со всеми дочерними) в один лист PDF.
+        Перед печатью временно разворачивает вложенные просмотры до полного содержимого.
+        """
+        if widget is None or not isinstance(widget, QWidget):
+            raise RuntimeError("report_panel не найден. Передай сюда контейнер отчёта (все левые+правые виджеты).")
+
+        # 1) подготовим содержимое: раздуем списки/таблицы/скроллы под весь контент
+        _restore = self._expand_children_for_print(widget)
+
+        try:
+            # После разворота уточним размер
+            widget.adjustSize()
+            QApplication.processEvents()
+
+            content_w = max(1, widget.width())
+            content_h = max(1, widget.height())
+
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setResolution(300)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(pdf_path)
+            printer.setPaperSize(QPrinter.A4)
+            printer.setFullPage(True)
+            printer.setOrientation(QPrinter.Landscape if content_w >= content_h else QPrinter.Portrait)
+
+            painter = QPainter(printer)
+            if not painter.isActive():
+                raise RuntimeError("Не удалось активировать QPainter для печати PDF")
+
+            # Целевая область страницы (пиксели устройства)
+            target = printer.pageRect(QPrinter.DevicePixel)
+
+            # Масштаб с сохранением пропорций + центрирование
+            sx = target.width() / float(content_w)
+            sy = target.height() / float(content_h)
+            scale = min(sx, sy)
+
+            view_w = int(content_w * scale)
+            view_h = int(content_h * scale)
+            offset_x = int((target.width() - view_w) / 2)
+            offset_y = int((target.height() - view_h) / 2)
+
+            painter.save()
+            painter.translate(offset_x, offset_y)   # int
+            painter.scale(scale, scale)             # тут float можно
+            widget.render(painter, flags=QWidget.DrawChildren)
+            painter.restore()
+            painter.end()
+
+        finally:
+            # 2) вернуть всё как было
+            try:
+                _restore()
+            except Exception:
+                pass
+
+    def _expand_children_for_print(self, root_widget):
+        """Раскрывает вложенные виджеты, чтобы в PDF попал весь контент.
+        Возвращает функцию-«откатчик», которую надо вызвать после печати.
+        """
+        saved = []
+
+        # ——— QTableView/QTableWidget: считаем точные ширину/высоту содержимого
+        for tv in root_widget.findChildren(QTableView):
+            state = {
+                "w": tv,
+                "size": tv.size(),
+                "hpol": tv.horizontalScrollBarPolicy(),
+                "vpol": tv.verticalScrollBarPolicy(),
+            }
+            saved.append(state)
+            try:
+                tv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                tv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                tv.resizeColumnsToContents()
+                tv.resizeRowsToContents()
+
+                vh = tv.verticalHeader()
+                hh = tv.horizontalHeader()
+                fw = tv.frameWidth() * 2
+
+                total_w = fw + vh.width() + sum(tv.columnWidth(c) for c in range(tv.model().columnCount()))
+                total_h = fw + hh.height() + sum(tv.rowHeight(r) for r in range(tv.model().rowCount()))
+                tv.resize(max(1, total_w), max(1, total_h))
+            except Exception:
+                pass
+
+        # ——— QListView/QListWidget: растягиваем по количеству элементов
+        for lv in root_widget.findChildren(QListView):
+            state = {
+                "w": lv,
+                "size": lv.size(),
+                "hpol": lv.horizontalScrollBarPolicy(),
+                "vpol": lv.verticalScrollBarPolicy(),
+            }
+            saved.append(state)
+            try:
+                lv.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                lv.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+                m = lv.model()
+                rows = m.rowCount() if m is not None else 0
+                # Прикидываем высоту: либо sizeHintForRow(0), либо высота шрифта
+                base_h = lv.sizeHintForRow(0) if rows > 0 else lv.fontMetrics().height() + 6
+                total_h = lv.frameWidth() * 2 + base_h * max(1, rows)
+
+                # Ширина: пусть будет текущая viewport ширина без горизонт. скролла
+                total_w = max(lv.width(), lv.viewport().sizeHint().width() + lv.frameWidth() * 2)
+
+                lv.resize(max(1, total_w), max(1, total_h))
+            except Exception:
+                pass
+
+        # ——— QScrollArea: раскрываем внутренний виджет
+        for sa in root_widget.findChildren(QScrollArea):
+            inner = sa.widget()
+            state = {
+                "w": sa,
+                "size": sa.size(),
+                "hpol": sa.horizontalScrollBarPolicy(),
+                "vpol": sa.verticalScrollBarPolicy(),
+                "inner_size": inner.size() if inner else None,
+            }
+            saved.append(state)
+            try:
+                sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                sa.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+                if inner:
+                    inner.adjustSize()
+                    inner.resize(inner.sizeHint())
+                    sa.resize(inner.width() + sa.frameWidth() * 2, inner.height() + sa.frameWidth() * 2)
+            except Exception:
+                pass
+
+        # ——— вернём как было
+        def _restore():
+            for st in saved:
+                w = st["w"]
+                try:
+                    if hasattr(w, "setHorizontalScrollBarPolicy"):
+                        w.setHorizontalScrollBarPolicy(st.get("hpol", Qt.ScrollBarAsNeeded))
+                    if hasattr(w, "setVerticalScrollBarPolicy"):
+                        w.setVerticalScrollBarPolicy(st.get("vpol", Qt.ScrollBarAsNeeded))
+                    w.resize(st["size"])
+                    if isinstance(w, QScrollArea) and st.get("inner_size") and w.widget():
+                        w.widget().resize(st["inner_size"])
+                except Exception:
+                    pass
+
+        return _restore
+
+    def _print_table_to_single_pdf(self, pdf_path, table):
+        # table.resizeColumnsToContents(); table.resizeRowsToContents()  # если нужно
+
+        vh = table.verticalHeader()
+        hh = table.horizontalHeader()
+        fw = table.frameWidth() * 2
+
+        content_w = int(fw + vh.width() + sum(table.columnWidth(c) for c in range(table.columnCount())))
+        content_h = int(fw + hh.height() + sum(table.rowHeight(r) for r in range(table.rowCount())))
+
+        if content_w <= 0 or content_h <= 0:
+            raise RuntimeError("Таблица пуста или нулевого размера — печатать нечего.")
+
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setResolution(300)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(pdf_path)
+        printer.setPaperSize(QPrinter.A4)
+        printer.setFullPage(True)
+        printer.setOrientation(QPrinter.Landscape if content_w >= content_h else QPrinter.Portrait)
+
+        painter = QPainter(printer)
+        if not painter.isActive():
+            raise RuntimeError("Не удалось активировать QPainter для печати PDF")
+
+        target = printer.pageRect(QPrinter.DevicePixel)  # QRect с int
+
+        old_size = table.size()
+        old_hpol = table.horizontalScrollBarPolicy()
+        old_vpol = table.verticalScrollBarPolicy()
+
+        try:
+            table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            table.resize(content_w, content_h)
+            QApplication.processEvents()
+
+            sx = target.width() / float(content_w)
+            sy = target.height() / float(content_h)
+            scale = min(sx, sy)
+
+            view_w = max(1, int(content_w * scale))
+            view_h = max(1, int(content_h * scale))
+            offset_x = int((target.width() - view_w) / 2)
+            offset_y = int((target.height() - view_h) / 2)
+
+            # Кормим QPainter прямоугольниками, а не float
+            painter.setViewport(QRect(offset_x, offset_y, view_w, view_h))
+            painter.setWindow(QRect(0, 0, int(content_w), int(content_h)))
+
+            table.render(painter, flags=QWidget.DrawChildren)
+
+        finally:
+            painter.end()
+            table.resize(old_size)
+            table.setHorizontalScrollBarPolicy(old_hpol)
+            table.setVerticalScrollBarPolicy(old_vpol)
 
 
 def main():
