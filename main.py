@@ -354,7 +354,7 @@ class MiniOdsEditor(QWidget):
         self.order_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.order_table.setFrameStyle(QFrame.NoFrame)
         self.order_table.setShowGrid(False)
-        self.order_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
+        self.order_table.setStyleSheet("QTableWidget::item { font-weight: 600; }")
         right_stack.addWidget(self.order_table)
 
         self.table = QTableWidget(0, 0, self)
@@ -520,32 +520,65 @@ class MiniOdsEditor(QWidget):
         f = tw.font(); f.setPointSizeF(UI_FONT_PT); tw.setFont(f)
 
 
+
+
     #------- Хэлперы для контроля допусков -------
+
+    # --- ОПП-хелперы (внутри класса MiniOdsEditor) ---
+    _OPP_RE = re.compile(
+        r'^\s*([+-]?\d+(?:[.,]\d+)?)\s*(?:\(\s*ОПП\s*([+-]?\d+(?:[.,]\d+)?)\s*\))?\s*$',
+        re.IGNORECASE
+    )
+
+    def _tol_current_part(self, s: str) -> str:
+        """Вернёт текущий допуск (без 'ОПП ...') в текстовой форме."""
+        m = self._OPP_RE.match((s or '').strip())
+        if not m: 
+            return (s or '').strip()
+        return (m.group(1) or '').strip()
+
+    def _tol_opp_part(self, s: str) -> str or None:
+        """Если в тексте есть '(ОПП X)', вернёт X (строкой), иначе None."""
+        m = self._OPP_RE.match((s or '').strip())
+        if not m:
+            return None
+        opp = m.group(2)
+        return (opp or '').strip() if opp else None
+
+    def _format_tol_with_opp(self, cur_txt: str, col: int) -> str:
+        """Сформировать отображение допуска: 'cur' или 'cur (ОПП base)' если cur != base."""
+        base = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
+        if base and self._canon_tol(cur_txt) != self._canon_tol(base):
+            return f"{cur_txt} (ОПП {base})"
+        return cur_txt
+
     def _snapshot_orig_tolerances(self):
-        """Зафиксировать «исходные» допуски как базу сравнения и снять подсветку."""
+        """Зафиксировать базовые допуски (ОПП). Если в ячейке уже есть ОПП — берём его."""
         cols = self.table.columnCount()
         self._orig_tol_texts = []
         for c in range(cols):
             it = self.table.item(TOL_ROW, c)
-            self._orig_tol_texts.append((it.text().strip() if it else ""))
+            raw = (it.text().strip() if it else "")
+            opp = self._tol_opp_part(raw)
+            base = opp if opp is not None else self._tol_current_part(raw)
+            self._orig_tol_texts.append(base)
         self._changed_tols.clear()
         self._apply_tol_highlight()
 
     def _canon_tol(self, s: str):
-        """Канонизированное представление допуска для сравнения."""
-        s = (s or "").strip().replace(",", ".")
+        """Числовая канонизация ТОЛЬКО текущей части допуска (без 'ОПП ...')."""
+        s = self._tol_current_part(s).replace(",", ".")
         try:
-            # округлим чуть-чуть, чтобы 1 и 1.0 считались равными
             return round(float(s), 9)
         except Exception:
-            return s.lower()
+            return s.lower().strip()
 
     def _mark_tol_change(self, col: int):
-        """Проверить и отметить, изменился ли допуск в колонке col относительно базового."""
+        """Отметить изменение допуска относительно БАЗОВОГО (ОПП)."""
         if col <= 0 or col >= self.table.columnCount():
             return
-        new_txt = (self.table.item(TOL_ROW, col).text().strip()
-                if self.table.item(TOL_ROW, col) else "")
+        cell = self.table.item(TOL_ROW, col)
+        new_txt = self._tol_current_part(cell.text() if cell else "")
         orig_txt = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
         if self._canon_tol(new_txt) == self._canon_tol(orig_txt):
             self._changed_tols.pop(col, None)
@@ -578,16 +611,17 @@ class MiniOdsEditor(QWidget):
         self.order_table.blockSignals(False)
 
     def _changed_tolerances_html(self) -> str:
-        """HTML-блок со списком изменённых допусков. Пустая строка, если изменений нет."""
+        """HTML-список изменённых допусков: было (ОПП) → стало (текущий)."""
         if not self._changed_tols:
             return ""
         items = []
         for c in sorted(self._changed_tols.keys()):
-            old_txt, new_txt = self._changed_tols[c]
+            base_txt, cur_txt = self._changed_tols[c]
             label = self._measure_label(c)
+            # показываем понятную пару "было → стало"
             items.append(
-                f"<li>Измерение <b>{html.escape(label)}</b>: было <i>{html.escape(old_txt or '—')}</i>, "
-                f"стало <i>{html.escape(new_txt or '—')}</i></li>"
+                f"<li>Измерение <b>{html.escape(label)}</b>: было <i>{html.escape(base_txt or '—')}</i>, "
+                f"стало <i>{html.escape(cur_txt or '—')}</i></li>"
             )
         return "<h3>Изменённые допуски:</h3><ul>" + "".join(items) + "</ul>"
 
@@ -671,7 +705,7 @@ class MiniOdsEditor(QWidget):
             self.table.blockSignals(False)
 
     def _rebuild_tol_cache(self):
-        """Считать допуски из TOL_ROW в массив, чтобы раскраска не трогала таблицу."""
+        """Считать ТЕКУЩИЕ допуски (без 'ОПП ...') из TOL_ROW в массив."""
         cols = self.table.columnCount()
         self._tol_cache = [None] * cols
         for c in range(cols):
@@ -679,7 +713,8 @@ class MiniOdsEditor(QWidget):
                 continue
             it = self.table.item(TOL_ROW, c)
             txt = (it.text() if it else "") or ""
-            self._tol_cache[c] = try_parse_float(txt.strip())
+            cur = self._tol_current_part(txt)
+            self._tol_cache[c] = try_parse_float(cur.strip())
 
     
     def _is_row_defective(self, r: int) -> bool:
@@ -1272,6 +1307,7 @@ class MiniOdsEditor(QWidget):
         self.order_table.blockSignals(False)
 
         self._sync_bars_and_captions_height()
+        self._apply_tol_highlight()
 
 
     
@@ -1491,25 +1527,37 @@ class MiniOdsEditor(QWidget):
             self.order_table.horizontalScrollBar().setValue(0)
             self._snapshot_orig_tolerances()
 
+
     def on_tol_cell_changed(self, row, col):
-        if col < 0: return
-        txt = self.tolerance_table.item(0, col).text() if self.tolerance_table.item(0, col) else ""
+        if col < 0:
+            return
+        # 1) забираем ввод пользователя из верхней панели и чистим от '(ОПП ...)'
+        raw = self.tolerance_table.item(0, col).text() if self.tolerance_table.item(0, col) else ""
+        cur_txt = self._tol_current_part(raw)
+
+        # 2) пишем в ОБЕ таблицы уже отформатированную строку с ОПП (если надо)
+        display = self._format_tol_with_opp(cur_txt, col)
+
         it = self.table.item(TOL_ROW, col)
         if it is None:
             it = QTableWidgetItem(""); self.table.setItem(TOL_ROW, col, it)
         try:
             self.table.blockSignals(True)
-            it.setText(txt); it.setBackground(WHITE)
+            it.setText(display); it.setBackground(WHITE)
         finally:
             self.table.blockSignals(False)
 
-        self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
+        it_top = self.tolerance_table.item(0, col)
+        if it_top is None:
+            it_top = QTableWidgetItem(""); self.tolerance_table.setItem(0, col, it_top)
+        it_top.setText(display)
+
+        # 3) пересчёты/раскраска
         self._rebuild_tol_cache()
         self.recheck_column(col)
+        self._mark_tol_change(col)     # <-- важно
         self._recompute_oos_counts()
         self._recompute_total_defects()
-        self._mark_tol_change(col)   # зафиксировать изменение и включить жёлтую подсветку
-        self._sync_order_row()       # на всякий случай обновить подписи/ширины и сохранить подсветку
 
     def on_cell_changed(self, row, col):
         # отражаем возможные изменения скрытых строк в панели/левых таблицах
