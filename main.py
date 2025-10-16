@@ -15,10 +15,12 @@ from odf.table import Table, TableRow, TableCell
 from odf.text import P
 
 # ---- Colors ----
-GREEN = QColor("#1A8830")   # soft green
-RED   = QColor("#8D1926")   # soft red
-BLUE  = QColor("#265C8F")   # kept for backward compat (открытие старых .ods)
-WHITE = QColor("#FFFFFF")
+GREEN = QColor("#1A8830")   # ok data
+RED   = QColor("#8D1926")   # bad data
+BLUE  = QColor("#265C8F")   # good data
+WHITE = QColor("#FFFFFF")   #
+BLACK = QColor("#000000")   # NoMeasure
+TEXT = QColor("#000000")    #
 
 # ---- Layout sizes ----
 HDR_PANEL_HEIGHT = 140
@@ -168,6 +170,8 @@ class MiniOdsEditor(QWidget):
         #center.setContentsMargins(0, 0, 0, 0)      # <-- добавь
         root.addLayout(center, stretch=1)
 
+        
+
         # left main info (col0 for all rows, except hidden 1,2,5 — мы их тоже скрываем здесь)
         self.info_main_table = QTableWidget(0, 1, self)
         self._setup_left_main_table(self.info_main_table)
@@ -181,7 +185,7 @@ class MiniOdsEditor(QWidget):
         self.info_main_caption.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.info_main_caption.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.info_main_caption.setColumnWidth(0, INFO_COL_WIDTH)  # ширина сразу здесь
-        cap_item = QTableWidgetItem("Серийный номер")
+        cap_item = QTableWidgetItem("Серийный/измерение")
         cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.info_main_caption.setItem(0, 0, cap_item)
         self.info_main_caption.setFrameStyle(QFrame.NoFrame)
@@ -201,6 +205,33 @@ class MiniOdsEditor(QWidget):
             lay.setSpacing(0)
             lay.setContentsMargins(0, 0, 0, 0)
 
+                # подпись для нижней строки ("Не в допуске")
+        self.info_oos_caption = QTableWidget(1, 1, self)
+        self.info_oos_caption.verticalHeader().setVisible(False)
+        self.info_oos_caption.horizontalHeader().setVisible(False)
+        self.info_oos_caption.setFixedHeight(32)
+        self.info_oos_caption.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.info_oos_caption.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_oos_caption.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.info_oos_caption.setColumnWidth(0, INFO_COL_WIDTH)
+        oos_cap_item = QTableWidgetItem("Не в допуске")
+        oos_cap_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.info_oos_caption.setItem(0, 0, oos_cap_item)
+        self.info_oos_caption.setFrameStyle(QFrame.NoFrame)
+        self.info_oos_caption.setShowGrid(False)
+        self.info_oos_caption.setStyleSheet(
+            "QTableWidget::item { background: white; font-weight: 600; padding: 6px; }"
+        )
+
+        # полоса счётчиков "Не в допуске" под основной таблицей
+        self.oos_table = QTableWidget(1, 0, self)
+        self._setup_top_table(self.oos_table, height=34, font_inc=0.0)
+        self.oos_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.oos_table.setFrameStyle(QFrame.NoFrame)
+        self.oos_table.setShowGrid(False)
+        self.oos_table.setStyleSheet("QTableWidget::item { background: white; font-weight: 600; }")
+
+
         # LEFT stack widgets
         left_stack.addWidget(self.info_header_table)
         left_sep1 = QFrame(); left_sep1.setFrameShape(QFrame.HLine); left_sep1.setFrameShadow(QFrame.Sunken)
@@ -211,6 +242,7 @@ class MiniOdsEditor(QWidget):
         left_stack.addWidget(self.info_main_caption)   # <— заголовок над таблицей
         left_stack.addWidget(self.info_main_table)     # <— сама таблица
 
+        left_stack.addWidget(self.info_oos_caption)    # подпись для не в интервале
 
         # RIGHT stack widgets
         right_stack.addWidget(self.header_table)
@@ -229,6 +261,7 @@ class MiniOdsEditor(QWidget):
         #right_sep2 = QFrame(); right_sep2.setFrameShape(QFrame.HLine); right_sep2.setFrameShadow(QFrame.Sunken)
         #right_stack.addWidget(right_sep2)
 
+
         # MAIN table
         self.table = QTableWidget(0, 0, self)
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
@@ -236,8 +269,11 @@ class MiniOdsEditor(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setVisible(False) 
         self.table.cellChanged.connect(self.on_cell_changed)
-        right_stack.addWidget(self.table)
+        right_stack.addWidget(self.table, stretch=1)   # важно: пусть main тянется
+        # под основной таблицей — полоса счётчиков
+        right_stack.addWidget(self.oos_table)
 
+    
         # put into center
         left_container = QWidget(); left_container.setLayout(left_stack)
         right_container = QWidget(); right_container.setLayout(right_stack)
@@ -246,6 +282,8 @@ class MiniOdsEditor(QWidget):
         sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
         center.addWidget(sep)
         center.addWidget(right_container, stretch=1)
+
+
 
         # --- Sync scrollbars & sizes ---
         # Horizontal: sync center header/tolerance with main
@@ -284,6 +322,11 @@ class MiniOdsEditor(QWidget):
 
         # Init
         self.build_table()
+
+        # main <-> oos_table (горизонтально)
+        self.table.horizontalScrollBar().valueChanged.connect(self.oos_table.horizontalScrollBar().setValue)
+        # oos_table без собственных полос, но связь в обе стороны не помешает
+        self.oos_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
 
     # ---------- UI setup helpers ----------
     def _apply_service_row_visibility(self):
@@ -464,6 +507,27 @@ class MiniOdsEditor(QWidget):
         # ничего дополнительно делать не нужно здесь
         self._sync_order_row()
 
+        # --- синхронизировать нижнюю полосу (oos_table) с main
+        cols = self.table.columnCount()
+        if self.oos_table.columnCount() != cols:
+            self.oos_table.blockSignals(True)
+            self.oos_table.setColumnCount(cols)
+            for c in range(cols):
+                it = self.oos_table.item(0, c)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.oos_table.setItem(0, c, it)
+                self.oos_table.item(0, c).setTextAlignment(Qt.AlignCenter)
+            self.oos_table.blockSignals(False)
+
+        # ширины колонок = как у main
+        for c in range(cols):
+            self.oos_table.setColumnWidth(c, self.table.columnWidth(c))
+
+        # скрываем 0-й столбец (описательный)
+        if cols > 0:
+            self.oos_table.setColumnHidden(0, True)
+
     def _sync_header_from_main(self):
         self.header_table.blockSignals(True)
         cols = self.table.columnCount()
@@ -525,7 +589,7 @@ class MiniOdsEditor(QWidget):
         self.order_table.blockSignals(False)
 
         # 
-        self._sync_order_and_caption_height()
+        self._sync_bars_and_captions_height()
 
     
     def on_hdr_cell_changed(self, row, col):
@@ -609,11 +673,13 @@ class MiniOdsEditor(QWidget):
             self.header_table.setColumnWidth(logicalIndex, newSize)
         if logicalIndex < self.order_table.columnCount():
             self.order_table.setColumnWidth(logicalIndex, newSize)
+        if logicalIndex < self.oos_table.columnCount():
+            self.oos_table.setColumnWidth(logicalIndex, newSize)
 
     def _on_main_row_height_changed(self, logicalIndex, oldSize, newSize):
         if 0 <= logicalIndex < self.info_main_table.rowCount():
             self.info_main_table.setRowHeight(logicalIndex, newSize)
-        self._sync_order_and_caption_height()
+        self._sync_bars_and_captions_height()
 
     def on_info_header_cell_changed(self, row, col):
         main_row = HEADER_ROWS[row]
@@ -667,6 +733,24 @@ class MiniOdsEditor(QWidget):
         # левая подпись «Серийный номер»
         self.info_main_caption.setFixedHeight(h)
 
+    def _sync_bars_and_captions_height(self):
+        """Высота полос (order/oos) и левых подписей = высоте первой рабочей строки."""
+        if self.table.rowCount() > FIRST_DATA_ROW:
+            h = self.table.rowHeight(FIRST_DATA_ROW)
+        else:
+            h = 34  # запасной
+
+        # верхняя полоса нумерации
+        self.order_table.setRowHeight(0, h)
+        self.order_table.setFixedHeight(h)
+        # нижняя полоса счётчиков
+        self.oos_table.setRowHeight(0, h)
+        self.oos_table.setFixedHeight(h)
+
+        # левые подписи
+        self.info_main_caption.setFixedHeight(h)
+        self.info_oos_caption.setFixedHeight(h)
+
     # ---------- UI callbacks ----------
     def build_table(self):
         cols = max(self.sb_cols.value(), 1)
@@ -706,6 +790,8 @@ class MiniOdsEditor(QWidget):
             self._sync_tol_from_main()
             self._sync_info_main_from_main()
             self._sync_order_row()
+            self._recompute_oos_counts()
+            self._sync_bars_and_captions_height()
             self.recolor_all()
 
         finally:
@@ -726,6 +812,7 @@ class MiniOdsEditor(QWidget):
             self.table.blockSignals(False)
         self._sync_tol_from_main()  # обновим левый tol и панели (на случай правок)
         self.recheck_column(col)
+        self._recompute_oos_counts()
 
     def on_cell_changed(self, row, col):
         # отражаем возможные изменения скрытых строк в панели/левых таблицах
@@ -744,6 +831,53 @@ class MiniOdsEditor(QWidget):
         # обычные данные — раскрасить
         it = self.table.item(row, col)
         self.recolor_cell(it, row, col)
+
+        if col > 0 and row >= FIRST_DATA_ROW:
+            self._recompute_oos_counts()
+
+    # не в допуске 
+    def _recompute_oos_counts(self):
+        """Посчитать количество ЧИСЕЛ вне допуска по каждому столбцу (c >= 1)."""
+        cols = self.table.columnCount()
+        rows = self.table.rowCount()
+        if cols == 0 or rows == 0:
+            return
+
+        # гарантируем структуру/ширины нижней полосы
+        self._ensure_panel_cols()
+
+        self.oos_table.blockSignals(True)
+        for c in range(cols):
+            if c == 0:
+                # описательный столбец — пусто
+                cell = self.oos_table.item(0, c)
+                if cell is None:
+                    cell = QTableWidgetItem("")
+                    self.oos_table.setItem(0, c, cell)
+                cell.setText("")
+                cell.setBackground(WHITE)
+                continue
+
+            tol = self._get_tol(c)
+            cnt = 0
+            if tol is not None:
+                for r in range(FIRST_DATA_ROW, rows):
+                    it = self.table.item(r, c)
+                    if not it:
+                        continue
+                    f = try_parse_float(it.text())
+                    if f is None:
+                        continue  # считаем ТОЛЬКО числа
+                    if abs(f) > tol:
+                        cnt += 1
+
+            cell = self.oos_table.item(0, c)
+            if cell is None:
+                cell = QTableWidgetItem("")
+                self.oos_table.setItem(0, c, cell)
+            cell.setText(str(cnt) if c > 0 else "")
+            cell.setBackground(WHITE)
+        self.oos_table.blockSignals(False)
 
     # ---------- ODS I/O ----------
     def save_to_ods(self):
@@ -901,6 +1035,8 @@ class MiniOdsEditor(QWidget):
         # чтобы нумерация начиналась с 1 на экране
         self.table.horizontalScrollBar().setValue(0)
         self.order_table.horizontalScrollBar().setValue(0)
+        self._recompute_oos_counts()
+        self._sync_bars_and_captions_height()
         self.recolor_all()
 
         if truncated:
