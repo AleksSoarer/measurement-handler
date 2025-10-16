@@ -3,7 +3,7 @@ import re
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QSpinBox, QPushButton, QTableWidget, QTableWidgetItem, QFileDialog,
-    QMessageBox
+    QMessageBox, QAbstractItemView
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
@@ -15,18 +15,16 @@ from odf.table import Table, TableRow, TableCell
 from odf.text import P
 
 # ---- Colors and limits ----
-GREEN = QColor("#C6EFCE")   # soft green
-RED   = QColor("#FFC7CE")   # soft red
-BLUE  = QColor("#9DC3E6")   # soft blue
+GREEN = QColor("#388E49")   # зелёный
+RED   = QColor("#C1192C")   # кранскы
+BLUE  = QColor("#2879C5")   # (оставлен для совместимости при открытии старых .ods)
 WHITE = QColor("#FFFFFF")
 
-# Global numeric rule
-DELTA = 0.5  # threshold for "number > DELTA -> BLUE"
-
 # Header rows (0-based indices)
-NOMINAL_ROW = 4        # 5th row shows "Nominal size"
-TOL_ROW     = 5        # 6th row shows "Tolerance"
-FIRST_DATA_ROW = 6     # data start row
+NOMINAL_ROW = 4        # 5-я строка: номинал (информативно)
+TOL_ROW     = 5        # 6-я строка: допуск (редактируется через закреплённую панель)
+FIRST_DATA_ROW = 6     # данные с 7-й строки
+TOL_PANEL_HEIGHT = 66  # ширана панели с допуском 
 
 # Hard cap for table size on load (to avoid OOM)
 MAX_CELLS = 200_000
@@ -114,8 +112,8 @@ def _sheet_content_bounds(sheet: Table):
 class MiniOdsEditor(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Мини-редактор ODS (цвета сохраняются, допуски)")
-        self.resize(1000, 700)
+        self.setWindowTitle("Мини-редактор ODS (допуски + фикс. строка)")
+        self.resize(1100, 760)
 
         root = QVBoxLayout(self)
 
@@ -148,24 +146,56 @@ class MiniOdsEditor(QWidget):
         ctrl.addStretch()
         root.addLayout(ctrl)
 
-        # Table
+        # --- Tolerance panel (fixed top 1-row table) ---
+        self.tolerance_table = QTableWidget(1, 0, self)
+        self.tolerance_table.verticalHeader().setVisible(False)
+        self.tolerance_table.horizontalHeader().setVisible(False)
+        self.tolerance_table.setFixedHeight(TOL_PANEL_HEIGHT)
+        self.tolerance_table.setRowHeight(0, TOL_PANEL_HEIGHT - 8)  # лёгкий внутренний отступ
+
+        # Чуть крупнее шрифт для читаемости (на +2pt к текущему):
+        tol_font = self.tolerance_table.font()
+        tol_font.setPointSizeF(tol_font.pointSizeF() + 2)
+        self.tolerance_table.setFont(tol_font)
+
+        # Добавим паддинг для кликабельности:
+        self.tolerance_table.setStyleSheet("""
+            QTableWidget::item { padding: 6px; }
+        """)
+
+
+        self.tolerance_table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.tolerance_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.tolerance_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.tolerance_table.cellChanged.connect(self.on_tol_cell_changed)
+        root.addWidget(self.tolerance_table)
+
+        # Main table
         self.table = QTableWidget(0, 0, self)
         self.table.cellChanged.connect(self.on_cell_changed)
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         root.addWidget(self.table)
+
+        # sync scrollbars & column widths
+        self.table.horizontalScrollBar().valueChanged.connect(
+            self.tolerance_table.horizontalScrollBar().setValue
+        )
+        self.tolerance_table.horizontalScrollBar().valueChanged.connect(
+            self.table.horizontalScrollBar().setValue
+        )
+        self.table.horizontalHeader().sectionResized.connect(self._on_main_section_resized)
 
         # Initial table
         self.build_table()
 
     # ---- Coloring rules ----
-    def _get_nom_tol(self, col):
-        """Return (nominal, tol) for given column or (None, None). Skip col=0."""
+    def _get_tol(self, col):
+        """Return tolerance for given column or None. Skip col=0."""
         if col == 0:
-            return None, None
-        nom_it = self.table.item(NOMINAL_ROW, col)
+            return None
         tol_it = self.table.item(TOL_ROW, col)
-        nom = try_parse_float(nom_it.text()) if nom_it else None
         tol = try_parse_float(tol_it.text()) if tol_it else None
-        return nom, tol
+        return tol
 
     def recolor_cell(self, it: QTableWidgetItem, row=None, col=None):
         if not it:
@@ -179,8 +209,13 @@ class MiniOdsEditor(QWidget):
         text = text_raw.strip()
         up = text.upper()
 
-        # Priority 0: hard markers
-        if up == "NM":
+        # первый столбец (описания/имена) всегда белый
+        if col == 0:
+            it.setBackground(WHITE)
+            return
+
+        # Маркеры соответствия/несоответствия
+        if up == "N" or up == "NM":
             it.setBackground(RED)
             return
         if up == "Y":
@@ -189,22 +224,23 @@ class MiniOdsEditor(QWidget):
 
         f = try_parse_float(text)
 
-        # Priority 1: tolerance logic for data rows and columns > 0
+        # Только для данных (с 7-й строки) и если допуск в колонке задан
         if (row >= FIRST_DATA_ROW) and (col > 0):
-            nom, tol = self._get_nom_tol(col)
-            if (nom is not None) and (tol is not None) and (f is not None):
-                if abs(f - nom) <= tol:
-                    it.setBackground(BLUE)   # in tolerance band
+            tol = self._get_tol(col)
+            if tol is not None and f is not None:
+                if abs(f) <= tol:
+                    it.setBackground(GREEN)   # в допуске
                 else:
-                    it.setBackground(RED)    # out of tolerance
+                    it.setBackground(RED)     # вне допуска
                 return
 
-        # Priority 2: legacy DELTA rule
-        if f is not None and f > DELTA:
-            it.setBackground(BLUE)
+        # Общая логика для остальных случаев (шапки и т.п.)
+        if row in (NOMINAL_ROW, TOL_ROW):
+            # номинал и допуск — информативные, оставляем белыми
+            it.setBackground(WHITE)
             return
 
-        # Priority 3: generic
+        # fallback: буквенные -> красный, цифровые -> зелёный, пустые -> белый
         if has_letters(text):
             it.setBackground(RED)
         elif has_digits(text):
@@ -224,11 +260,8 @@ class MiniOdsEditor(QWidget):
             self.table.blockSignals(False)
 
     def recheck_column(self, col: int):
-        """Repaint entire column after nominal/tolerance change."""
+        """Repaint entire column after tolerance change."""
         if col <= 0:
-            return
-        nom, tol = self._get_nom_tol(col)
-        if nom is None or tol is None:
             return
         try:
             self.table.blockSignals(True)
@@ -240,16 +273,60 @@ class MiniOdsEditor(QWidget):
         finally:
             self.table.blockSignals(False)
 
+    # ---- UI helpers for tolerance panel ----
+    def _ensure_tol_panel_cols(self):
+        cols = self.table.columnCount()
+        if self.tolerance_table.columnCount() != cols:
+            self.tolerance_table.blockSignals(True)
+            self.tolerance_table.setColumnCount(cols)
+            # инициализируем ячейки
+            for c in range(cols):
+                it = self.tolerance_table.item(0, c)
+                if it is None:
+                    self.tolerance_table.setItem(0, c, QTableWidgetItem(""))
+                self.tolerance_table.item(0, c).setTextAlignment(Qt.AlignCenter)
+            self.tolerance_table.blockSignals(False)
+        # синхронизируем ширины
+        for c in range(cols):
+            w = self.table.columnWidth(c)
+            if self.tolerance_table.columnWidth(c) != w:
+                self.tolerance_table.setColumnWidth(c, w)
+
+    def _sync_tol_from_main(self):
+        """Скопировать значения допусков из скрытой строки основной таблицы в панель."""
+        self._ensure_tol_panel_cols()
+        try:
+            self.tolerance_table.blockSignals(True)
+            cols = self.table.columnCount()
+            for c in range(cols):
+                src = self.table.item(TOL_ROW, c)
+                txt = src.text() if src else ""
+                it = self.tolerance_table.item(0, c)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.tolerance_table.setItem(0, c, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt)
+        finally:
+            self.tolerance_table.blockSignals(False)
+
+    def _on_main_section_resized(self, logicalIndex, oldSize, newSize):
+        # Подгоняем ширину столбца панели допусков под основной
+        if logicalIndex < self.tolerance_table.columnCount():
+            self.tolerance_table.setColumnWidth(logicalIndex, newSize)
+
     # ---- UI callbacks ----
     def build_table(self):
         cols = max(self.sb_cols.value(), 1)
-        # ensure we have at least header rows
         rows = max(self.sb_rows.value(), FIRST_DATA_ROW + 1)
         try:
             self.table.blockSignals(True)
             self.table.setColumnCount(cols)
             self.table.setRowCount(rows)
             self.table.clearContents()
+
+            # скрываем вертикальный хедер для аккуратного вида
+            self.table.verticalHeader().setVisible(False)
 
             for r in range(rows):
                 for c in range(cols):
@@ -259,14 +336,56 @@ class MiniOdsEditor(QWidget):
                         self.table.setItem(r, c, it)
                     it.setTextAlignment(Qt.AlignCenter)
                     it.setBackground(WHITE)
+
+            # перенести/инициализировать допуски в панель
+            self._ensure_tol_panel_cols()
+            # наполняем панель текущими значениями допусков (пока они пустые)
+            self._sync_tol_from_main()
+            # прячем строку допусков в основной таблице, чтобы не дублировать
+            if rows > TOL_ROW:
+                self.table.setRowHidden(TOL_ROW, True)
         finally:
             self.table.blockSignals(False)
 
+    def on_tol_cell_changed(self, row, col):
+        """Пользователь отредактировал допуск в панели — обновим скрытую строку и перекрасим колонку."""
+        if col < 0:
+            return
+        txt = self.tolerance_table.item(0, col).text() if self.tolerance_table.item(0, col) else ""
+        # Запишем в скрытую строку допусков основной таблицы
+        it = self.table.item(TOL_ROW, col)
+        if it is None:
+            it = QTableWidgetItem("")
+            self.table.setItem(TOL_ROW, col, it)
+        try:
+            self.table.blockSignals(True)
+            it.setText(txt)
+            it.setBackground(WHITE)  # допуск — информативный
+        finally:
+            self.table.blockSignals(False)
+        # Перекрасим колонку
+        self.recheck_column(col)
+
     def on_cell_changed(self, row, col):
-        # If nominal/tolerance edited, repaint entire column
-        if row in (NOMINAL_ROW, TOL_ROW):
+        # Если пользователь изменил исходную строку допусков (теоретически она скрыта),
+        # то обновим панель тоже
+        if row == TOL_ROW:
+            # синхронизируем одно значение в панель
+            src = self.table.item(TOL_ROW, col)
+            txt = src.text() if src else ""
+            try:
+                self.tolerance_table.blockSignals(True)
+                it = self.tolerance_table.item(0, col)
+                if it is None:
+                    it = QTableWidgetItem("")
+                    self.tolerance_table.setItem(0, col, it)
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setText(txt)
+            finally:
+                self.tolerance_table.blockSignals(False)
             self.recheck_column(col)
             return
+
         it = self.table.item(row, col)
         self.recolor_cell(it, row, col)
 
@@ -341,7 +460,6 @@ class MiniOdsEditor(QWidget):
             return
         sheet = tables[0]
 
-        # 1) get content bounds instead of expanding repeated empties
         content_rows, content_cols = _sheet_content_bounds(sheet)
         if content_rows == 0 or content_cols == 0:
             try:
@@ -361,7 +479,6 @@ class MiniOdsEditor(QWidget):
                 self.table.blockSignals(False)
             return
 
-        # 2) cap by MAX_CELLS
         est_cells = content_rows * content_cols
         truncated = est_cells > MAX_CELLS
         use_cols = content_cols
@@ -372,7 +489,6 @@ class MiniOdsEditor(QWidget):
             self.table.setUpdatesEnabled(False)
 
             self.table.clearContents()
-            # Also ensure we still have header rows visible even if file is tiny
             final_rows = max(use_rows, FIRST_DATA_ROW + 1)
             self.table.setRowCount(final_rows)
             self.table.setColumnCount(use_cols)
@@ -410,7 +526,7 @@ class MiniOdsEditor(QWidget):
                                 self.table.setItem(row_idx, c, it)
                             it.setTextAlignment(Qt.AlignCenter)
                             it.setText(text)
-                            # we ignore external styles and recolor by our rules
+                            # перекрашиваем по НОВЫМ правилам
                             self.recolor_cell(it, row_idx, c)
                             c += 1
                             if c >= use_cols:
@@ -419,7 +535,7 @@ class MiniOdsEditor(QWidget):
                             break
                     row_idx += 1
 
-            # Fill remaining rows (if we extended to ensure header presence)
+            # Fill remaining rows (если расширили вниз)
             for r in range(use_rows, final_rows):
                 for c in range(use_cols):
                     it = self.table.item(r, c)
@@ -432,6 +548,12 @@ class MiniOdsEditor(QWidget):
         finally:
             self.table.setUpdatesEnabled(True)
             self.table.blockSignals(False)
+
+        # обновим панель допусков из строки TOL_ROW и спрячем её в основной
+        self._ensure_tol_panel_cols()
+        self._sync_tol_from_main()
+        if self.table.rowCount() > TOL_ROW:
+            self.table.setRowHidden(TOL_ROW, True)
 
         if truncated:
             QMessageBox.information(
