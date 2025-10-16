@@ -1,771 +1,453 @@
-# -*- coding: utf-8 -*-
 import sys
 import re
-
-# PyQt5
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QFileDialog, QWidget,
-    QVBoxLayout, QPushButton, QLineEdit, QTableWidget,
-    QTableWidgetItem, QLabel, QSplitter
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QSpinBox, QPushButton, QTableWidget, QTableWidgetItem, QFileDialog,
+    QMessageBox
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
-# Работа с ODS
-import ezodf  # для opendoc/saveas
-from odf.style import Style as EzStyle, TableCellProperties, TextProperties
+# ODS
+from odf.opendocument import OpenDocumentSpreadsheet, load
+from odf.style import Style, TableCellProperties
+from odf.table import Table, TableRow, TableCell
+from odf.text import P
 
-# ────────────────────────────────────────────────────────────────────────
-# Палитра для GUI
-GOOD  = QColor("#C6EFCE")   # мягко-зелёный
-BAD   = QColor("#FFC7CE")   # мягко-красный
+# ---- Colors and limits ----
+GREEN = QColor("#C6EFCE")   # soft green
+RED   = QColor("#FFC7CE")   # soft red
+BLUE  = QColor("#9DC3E6")   # soft blue
+WHITE = QColor("#FFFFFF")
 
-# ────────────────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# Global numeric rule
+DELTA = 0.5  # threshold for "number > DELTA -> BLUE"
 
-def qcolor_hex(qc: QColor) -> str:
-    return "#{:02x}{:02x}{:02x}".format(qc.red(), qc.green(), qc.blue())
+# Header rows (0-based indices)
+NOMINAL_ROW = 4        # 5th row shows "Nominal size"
+TOL_ROW     = 5        # 6th row shows "Tolerance"
+FIRST_DATA_ROW = 6     # data start row
 
-def col2num(col: str) -> int:
-    """ 'A' -> 0, 'AA' -> 26 """
-    n = 0
-    for c in col.upper():
-        n = n * 26 + (ord(c) - 64)
-    return n - 1
+# Hard cap for table size on load (to avoid OOM)
+MAX_CELLS = 200_000
 
-def parse_range(rng: str):
-    """
-    'A1:D10' -> (fc, fr, tc, tr) в 0-базисе.
-    Пробелы/нижний регистр допускаются.
-    """
-    rng = rng.strip()
-    m = re.fullmatch(r'\s*([A-Za-z]+)\s*(\d+)\s*:\s*([A-Za-z]+)\s*(\d+)\s*', rng)
-    if not m:
-        raise ValueError(f'Неверный диапазон: {rng!r}. Ожидается формат A1:D10.')
-    fc, fr, tc, tr = m.groups()
-    return col2num(fc), int(fr) - 1, col2num(tc), int(tr) - 1
 
-def _parse_float(x):
-    if x is None:
+# ---- Helpers ----
+def has_letters(s: str) -> bool:
+    return bool(re.search(r'[A-Za-zА-Яа-я]', s or ""))
+
+
+def has_digits(s: str) -> bool:
+    return any(ch.isdigit() for ch in (s or ""))
+
+
+def try_parse_float(s: str):
+    if s is None:
         return None
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        s = x.strip().replace('\xa0', ' ').replace(',', '.')
-        try:
-            return float(s)
-        except Exception:
-            return None
-    return None
+    s = s.strip()
+    if not s:
+        return None
+    candidate = s.replace(',', '.')
+    try:
+        return float(candidate)
+    except ValueError:
+        return None
 
-def ods_number(cell):
-    """
-    Возвращает float для ячейки, даже если там формула:
-    1) cell.value (если число),
-    2) office:value (кэш формулы),
-    3) парсинг текстовых узлов.
-    """
-    v = _parse_float(getattr(cell, 'value', None))
-    if v is not None:
-        return v
 
-    el = getattr(cell, 'xmlnode', None) or getattr(cell, '_element', None) or getattr(cell, 'element', None)
-    if el is not None and hasattr(el, 'getAttribute'):
-        raw = el.getAttribute('office:value')
-        v = _parse_float(raw)
+def _extract_text_from_cell(cell: TableCell) -> str:
+    """Collect visible text from <text:p> nodes or fallback to office:value."""
+    parts = []
+    for p in cell.getElementsByType(P):
+        for node in getattr(p, 'childNodes', []):
+            data = getattr(node, 'data', None)
+            if data:
+                parts.append(str(data))
+    text = "".join(parts).strip()
+    if not text:
+        v = cell.getAttribute('value')
         if v is not None:
-            return v
+            text = str(v)
+    return text
 
-    
-    txt = None
-    try:
-        if el is not None:
-            buf = []
-            for n in getattr(el, 'childNodes', []):
-                data = getattr(n, 'data', None)
-                if isinstance(data, str):
-                    buf.append(data)
-            if buf:
-                txt = ''.join(buf)
-    except Exception:
-        pass
-    return _parse_float(txt)
 
-def set_cell_style_name(cell, style_name: str):
+def _cell_has_content(cell: TableCell) -> bool:
+    """Detect non-empty cell for bounds detection (fast check)."""
+    v = cell.getAttribute('value')
+    if v not in (None, ""):
+        return True
+    for p in cell.getElementsByType(P):
+        for node in getattr(p, 'childNodes', []):
+            if getattr(node, 'data', None):
+                return True
+    return False
+
+
+def _sheet_content_bounds(sheet: Table):
     """
-    Надёжно проставляет стиль ячейке:
-    1) через свойство .style_name
-    2) принудительно table:style-name в XML
+    Determine content area (rows, cols) ignoring trailing empty rows/cols,
+    respecting number-rows/columns-repeated attributes without expansion.
+    Returns (content_rows, content_cols).
     """
-    try:
-        cell.style_name = style_name
-    except Exception:
-        pass
-    el = getattr(cell, 'xmlnode', None) or getattr(cell, '_element', None) or getattr(cell, 'element', None)
-    if el is not None and hasattr(el, 'setAttribute'):
-        try:
-            el.setAttribute('table:style-name', style_name)
-        except Exception:
-            pass
+    content_cols = 0
+    content_rows = 0
+    for row in sheet.getElementsByType(TableRow):
+        rrep = int(row.getAttribute('numberrowsrepeated') or 1)
 
-# ────────────────────────────────────────────────────────────────────────
-# Доступ к стилям документа
+        row_has_content = False
+        last_col_in_row = -1
+        col_idx = 0
 
-def _find_style_in_container(container, name: str):
-    """Ищем стиль по name в контейнере (поддержка и .get, и перебора)."""
-    if container is None:
-        return None
-    # Попытка через .get (pyexcel-ezodf)
-    if hasattr(container, "get"):
-        try:
-            st = container.get(str(name))
-            if st:
-                return st
-        except Exception:
-            pass
-    # Перебор (odfpy)
-    try:
-        for st in container.getElementsByType(EzStyle):
-            if st.getAttribute('name') == name:
-                return st
-    except Exception:
-        pass
-    return None
+        for cell in row.getElementsByType(TableCell):
+            crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
+            if _cell_has_content(cell):
+                row_has_content = True
+                last_col_in_row = max(last_col_in_row, col_idx + crep - 1)
+            col_idx += crep
 
-def _get_style_by_name(doc, sname):
-    if not sname:
-        return None
-    auto = getattr(doc, "automatic_styles", None) or getattr(doc, "automaticstyles", None)
-    styles = getattr(doc, "styles", None) or getattr(doc, "styles_", None)
-    st = _find_style_in_container(auto, str(sname))
-    if st is None:
-        st = _find_style_in_container(styles, str(sname))
-    return st
+        if row_has_content:
+            content_rows += rrep
+            content_cols = max(content_cols, last_col_in_row + 1)
 
-def _get_style_bg(sname, ods_doc):
-    st = _get_style_by_name(ods_doc, sname)
-    if not st:
-        return None
-    # старый pyexcel-ezodf: dict-like
-    props = getattr(st, "properties", None)
-    if isinstance(props, dict):
-        return props.get("fo:background-color")
-    # odfpy: смотреть table-cell-properties
-    if hasattr(st, "getAttribute"):
-        # напрямую
-        val = st.getAttribute("fo:background-color")
-        if val:
-            return val
-        # через дочерние узлы
-        try:
-            for child in getattr(st, "childNodes", []):
-                qname = getattr(child, "qname", None)
-                if qname and qname[1] == "table-cell-properties":
-                    v = child.getAttribute("fo:background-color")
-                    if v:
-                        return v
-        except Exception:
-            pass
-    return None
+    return content_rows, content_cols
 
-def get_bg_hex(cell, ods_doc):
-    """
-    Возвращает цвет заливки конкретной ячейки с учётом наследования:
-    ячейка -> строка -> столбец -> default-cell-style таблицы.
-    """
-    # 1) стиль ячейки
-    sname = getattr(cell, "style_name", None)
-    hexclr = _get_style_bg(sname, ods_doc)
-    if hexclr:
-        return hexclr
 
-    # 2) стиль строки
-    try:
-        row_idx = getattr(cell, "row", None)
-        if row_idx is not None:
-            rowstyle = cell.table.rows[row_idx].style_name
-            hexclr = _get_style_bg(rowstyle, ods_doc)
-            if hexclr:
-                return hexclr
-    except Exception:
-        pass
-
-    # 3) стиль столбца
-    try:
-        col_idx = getattr(cell, "column", None)
-        if col_idx is not None:
-            colstyle = cell.table.columns[col_idx].style_name
-            hexclr = _get_style_bg(colstyle, ods_doc)
-            if hexclr:
-                return hexclr
-    except Exception:
-        pass
-
-    # 4) стиль по умолчанию таблицы
-    try:
-        default_style = getattr(cell.table, "default_cell_style_name", None)
-        hexclr = _get_style_bg(default_style, ods_doc)
-        if hexclr:
-            return hexclr
-    except Exception:
-        pass
-    return None
-
-def get_cell_style(cell, ods_doc):
-    """
-    Возвращает dict:
-      {'bg', 'text_color', 'bold', 'italic', 'underline', 'fontsize'}
-    """
-    result = {
-        'bg': get_bg_hex(cell, ods_doc),
-        'text_color': None,
-        'bold': False,
-        'italic': False,
-        'underline': False,
-        'fontsize': None,
-    }
-    sname = getattr(cell, "style_name", None)
-    st = _get_style_by_name(ods_doc, sname)
-    if not st:
-        return result
-
-    # Ищем text-properties
-    try:
-        for child in getattr(st, "childNodes", []):
-            qname = getattr(child, "qname", None)
-            if not qname:
-                continue
-            tag = qname[1]
-            if tag == "text-properties":
-                color = child.getAttribute("fo:color")
-                if color:
-                    result['text_color'] = color
-                if child.getAttribute("fo:font-weight") == "bold":
-                    result['bold'] = True
-                if child.getAttribute("fo:font-style") == "italic":
-                    result['italic'] = True
-                if child.getAttribute("style:text-underline-style") not in (None, "none"):
-                    result['underline'] = True
-                size = child.getAttribute("fo:font-size")
-                if size:
-                    try:
-                        result['fontsize'] = float(size.replace('pt',''))
-                    except Exception:
-                        result['fontsize'] = size
-    except Exception:
-        pass
-    return result
-
-# ────────────────────────────────────────────────────────────────────────
-# СОЗДАНИЕ/КЛОНИРОВАНИЕ СТИЛЕЙ
-
-def _auto_container(doc):
-    return getattr(doc, "automatic_styles", None) or getattr(doc, "automaticstyles", None)
-
-def _add_style_to_doc(doc, style_obj):
-    auto = _auto_container(doc)
-    if auto is not None:
-        if hasattr(auto, "addElement"):
-            auto.addElement(style_obj)
-        else:
-            # старые обёртки — list-like
-            auto.append(style_obj)
-
-def ensure_style(doc, hexclr: str, cache: dict) -> str:
-    """
-    Возвращает имя стиля с заданной заливкой, создаёт при необходимости.
-    """
-    if hexclr in cache:
-        return cache[hexclr]
-    sname = f"bg_{hexclr.lstrip('#')}"
-    st = EzStyle(name=sname, family='table-cell')
-    st.addElement(TableCellProperties(backgroundcolor=hexclr))
-    _add_style_to_doc(doc, st)
-    cache[hexclr] = sname
-    return sname
-
-def clone_style_with_new_bg(doc, orig_style_name: str, new_bg: str, cache: dict) -> str:
-    """
-    Клонирует существующий стиль ячейки, меняя ТОЛЬКО фон (backgroundcolor),
-    сохраняя остальные свойства (границы, шрифт и т.п.).
-    """
-    key = (orig_style_name, new_bg)
-    if key in cache:
-        return cache[key]
-
-    orig_style = _get_style_by_name(doc, orig_style_name)
-    if orig_style is None:
-        # исходник не нашли — просто создаём новый стиль с нужным фоном
-        name = ensure_style(doc, new_bg, cache)
-        cache[key] = name
-        return name
-
-    new_name = f"{orig_style_name}_bg_{new_bg.lstrip('#')}"
-    new_style = EzStyle(name=new_name, family="table-cell")
-
-    has_cell_props = False
-    for el in getattr(orig_style, "childNodes", []):
-        qname = getattr(el, "qname", (None, None))
-        tag = qname[1] if qname else None
-        if tag == "table-cell-properties":
-            has_cell_props = True
-            cp = TableCellProperties()
-            for attr in el.attributes.keys():
-                val = el.getAttribute(attr)
-                if attr == "fo:background-color":
-                    cp.setAttribute(attr, new_bg)
-                else:
-                    cp.setAttribute(attr, val)
-            new_style.addElement(cp)
-        else:
-            new_style.addElement(el.cloneNode(True))
-
-    if not has_cell_props:
-        new_style.addElement(TableCellProperties(backgroundcolor=new_bg))
-
-    _add_style_to_doc(doc, new_style)
-    cache[key] = new_name
-    return new_name
-
-def ensure_style_with_text(doc, bg_color: str, text_color: str, cache: dict) -> str:
-    """Стиль ячейки с заданными фоном и цветом текста."""
-    key = (bg_color, text_color)
-    if key in cache:
-        return cache[key]
-    style_name = f"bg_{bg_color.lstrip('#')}_text_{text_color.lstrip('#')}"
-    st = EzStyle(name=style_name, family="table-cell")
-    st.addElement(TableCellProperties(backgroundcolor=bg_color))
-    st.addElement(TextProperties(color=text_color))
-    _add_style_to_doc(doc, st)
-    cache[key] = style_name
-    return style_name
-
-def clone_style_with_new_bg_text(doc, orig_style_name: str, new_bg: str, new_text: str, cache: dict) -> str:
-    """Клонирует стиль, меняя фон и цвет текста, сохраняя остальное."""
-    key = (orig_style_name, new_bg, new_text)
-    if key in cache:
-        return cache[key]
-
-    orig_style = _get_style_by_name(doc, orig_style_name)
-    if orig_style is None:
-        # исходный стиль не нашли — создаём новый с нужными цветами
-        name = ensure_style_with_text(doc, new_bg, new_text, cache)
-        cache[key] = name
-        return name
-
-    new_style_name = f"{orig_style_name}_bg_{new_bg.lstrip('#')}_text_{new_text.lstrip('#')}"
-    new_style = EzStyle(name=new_style_name, family="table-cell")
-
-    has_cell_props = False
-    has_text_props = False
-    for el in getattr(orig_style, "childNodes", []):
-        qname = getattr(el, "qname", (None, None))
-        tag = qname[1] if qname else None
-        if tag == "table-cell-properties":
-            has_cell_props = True
-            cp = TableCellProperties()
-            for attr in el.attributes.keys():
-                val = el.getAttribute(attr)
-                if attr == "fo:background-color":
-                    cp.setAttribute(attr, new_bg)
-                else:
-                    cp.setAttribute(attr, val)
-            new_style.addElement(cp)
-        elif tag == "text-properties":
-            has_text_props = True
-            tp = TextProperties()
-            for attr in el.attributes.keys():
-                val = el.getAttribute(attr)
-                if attr == "fo:color":
-                    tp.setAttribute(attr, new_text)
-                else:
-                    tp.setAttribute(attr, val)
-            new_style.addElement(tp)
-        else:
-            new_style.addElement(el.cloneNode(True))
-
-    if not has_cell_props:
-        new_style.addElement(TableCellProperties(backgroundcolor=new_bg))
-    if not has_text_props:
-        new_style.addElement(TextProperties(color=new_text))
-
-    _add_style_to_doc(doc, new_style)
-    cache[key] = new_style_name
-    return new_style_name
-
-def clone_style_with_new_bg_clear_text(doc, orig_style_name: str, new_bg: str, cache: dict) -> str:
-    """
-    Клонирует стиль, меняя ТОЛЬКО фон и сбрасывая цвет текста (fo:color).
-    Все прочие свойства сохраняются.
-    """
-    key = (orig_style_name, new_bg, '__clear_text_color__')
-    if key in cache:
-        return cache[key]
-
-    orig = _get_style_by_name(doc, orig_style_name)
-    if orig is None:
-        name = ensure_style(doc, new_bg, cache)
-        cache[key] = name
-        return name
-
-    new_name = f"{orig_style_name}_bg_{new_bg.lstrip('#')}_clrtext"
-    new_style = EzStyle(name=new_name, family="table-cell")
-
-    has_cell_props = False
-    for el in getattr(orig, "childNodes", []):
-        qname = getattr(el, "qname", (None, None))
-        tag = qname[1] if qname else None
-
-        if tag == "table-cell-properties":
-            has_cell_props = True
-            cp = TableCellProperties()
-            for attr in el.attributes.keys():
-                val = el.getAttribute(attr)
-                if attr == "fo:background-color":
-                    cp.setAttribute(attr, new_bg)
-                else:
-                    cp.setAttribute(attr, val)
-            new_style.addElement(cp)
-
-        elif tag == "text-properties":
-            # копируем всё, кроме fo:color (сбрасываем цвет текста)
-            tp = TextProperties()
-            for attr in el.attributes.keys():
-                if attr == "fo:color":
-                    continue
-                tp.setAttribute(attr, el.getAttribute(attr))
-            new_style.addElement(tp)
-
-        else:
-            new_style.addElement(el.cloneNode(True))
-
-    if not has_cell_props:
-        new_style.addElement(TableCellProperties(backgroundcolor=new_bg))
-
-    _add_style_to_doc(doc, new_style)
-    cache[key] = new_name
-    return new_name
-
-# ────────────────────────────────────────────────────────────────────────
-# ТАБЛИЦА ДЛЯ GUI
-
-class ToleranceAwareTable(QTableWidget):
-    def recheck_column(self, col: int, tol: float):
-        for r in range(self.rowCount()):
-            item = self.item(r, col)
-            if item is None:
-                continue
-            text = item.text().strip()
-            up = text.upper()
-
-            # NM → чёрный фон + белый текст
-            if up == "NM":
-                item.setBackground(QColor("#000000"))
-                item.setForeground(QColor("#FFFFFF"))
-                continue
-
-            # Y → зелёный фон
-            if up == "Y":
-                item.setBackground(GOOD)
-                continue
-
-            # Число: |value| <= tol → зелёный, иначе красный
-            try:
-                v = float(text)
-            except ValueError:
-                # другое текстовое значение — не трогаем фон в UI
-                continue
-
-            item.setBackground(GOOD if abs(v) <= tol else BAD)
-
-# ────────────────────────────────────────────────────────────────────────
-# ОСНОВНОЕ ОКНО
-
-class ODSViewer(QMainWindow):
-    NOMINAL_ROW = 4          # в файле (0-based)
-    TOL_ROW     = 5
-
+class MiniOdsEditor(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('ODS viewer w/ tolerances')
+        self.setWindowTitle("Мини-редактор ODS (цвета сохраняются, допуски)")
         self.resize(1000, 700)
 
-        # ── UI -----------------------------------------------------------
-        main = QWidget(self); self.setCentralWidget(main)
-        vbox = QVBoxLayout(main)
+        root = QVBoxLayout(self)
 
-        self.btn_open  = QPushButton('Открыть ODS'); vbox.addWidget(self.btn_open)
-        self.btn_open.clicked.connect(self.open_file)
+        # Controls
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("Колонки (X):"))
+        self.sb_cols = QSpinBox()
+        self.sb_cols.setRange(1, 2000)
+        self.sb_cols.setValue(8)
+        ctrl.addWidget(self.sb_cols)
 
-        self.range_in  = QLineEdit('A1:D10')
-        vbox.addWidget(QLabel('Диапазон (опц.):')); vbox.addWidget(self.range_in)
+        ctrl.addWidget(QLabel("Строки (Y):"))
+        self.sb_rows = QSpinBox()
+        self.sb_rows.setRange(1, 5000)
+        self.sb_rows.setValue(12)
+        ctrl.addWidget(self.sb_rows)
 
-        self.btn_show  = QPushButton('Показать диапазон'); vbox.addWidget(self.btn_show)
-        self.btn_show.clicked.connect(self.show_range)
+        self.btn_build = QPushButton("Создать таблицу")
+        self.btn_build.clicked.connect(self.build_table)
+        ctrl.addWidget(self.btn_build)
 
-        self.split     = QSplitter(Qt.Vertical); vbox.addWidget(self.split, 1)
+        self.btn_open = QPushButton("Открыть .ods")
+        self.btn_open.clicked.connect(self.open_ods)
+        ctrl.addWidget(self.btn_open)
 
-        # «шапка» 2×N
-        self.head_table = QTableWidget(2, 0)
-        self.head_table.setVerticalHeaderLabels(['Номинал','Допуск'])
-        self.split.addWidget(self.head_table)
+        self.btn_save = QPushButton("Сохранить в .ods")
+        self.btn_save.clicked.connect(self.save_to_ods)
+        ctrl.addWidget(self.btn_save)
 
-        # «тело» измерений M×N
-        self.body_table = ToleranceAwareTable(0, 0)
-        self.split.addWidget(self.body_table)
+        ctrl.addStretch()
+        root.addLayout(ctrl)
 
-        # ── служебное
-        self.sheet = None
-        self.ods_doc = None
-        self.current_path = ""
-        self.range_first_col = 0
+        # Table
+        self.table = QTableWidget(0, 0, self)
+        self.table.cellChanged.connect(self.on_cell_changed)
+        root.addWidget(self.table)
 
-        # связка: если меняется допуск -> перепроверяем столбец
-        self.head_table.cellChanged.connect(self._on_head_changed)
+        # Initial table
+        self.build_table()
 
-        self.btn_save = QPushButton('Сохранить как…')
-        vbox.addWidget(self.btn_save)
-        self.btn_save.clicked.connect(self.save_as)
-        self.btn_save.setEnabled(False)          # активируем после открытия файла
+    # ---- Coloring rules ----
+    def _get_nom_tol(self, col):
+        """Return (nominal, tol) for given column or (None, None). Skip col=0."""
+        if col == 0:
+            return None, None
+        nom_it = self.table.item(NOMINAL_ROW, col)
+        tol_it = self.table.item(TOL_ROW, col)
+        nom = try_parse_float(nom_it.text()) if nom_it else None
+        tol = try_parse_float(tol_it.text()) if tol_it else None
+        return nom, tol
 
-    # -------- file open --------------------------------------------------
-    def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, 'ODS', '', 'ODS (*.ods)')
-        if not path:
+    def recolor_cell(self, it: QTableWidgetItem, row=None, col=None):
+        if not it:
             return
-        self.ods_doc = ezodf.opendoc(path)       # сохраняем документ
-        self.sheet   = self.ods_doc.sheets[0]
-        self.current_path = path
-        self.btn_save.setEnabled(True)
-        self.show_range()                        # сразу отрисовываем
+        if row is None or col is None:
+            idx = self.table.indexFromItem(it)
+            row = idx.row()
+            col = idx.column()
 
-    # -------- отображение диапазона или всей таблицы --------------------
-    def show_range(self):
-        if not self.sheet:
+        text_raw = it.text() or ""
+        text = text_raw.strip()
+        up = text.upper()
+
+        # Priority 0: hard markers
+        if up == "NM":
+            it.setBackground(RED)
             return
-        # ------ определяем границы --------------------------------------
-        rng = self.range_in.text().strip()
-        if rng:
-            fc, fr, tc, tr = parse_range(rng)
+        if up == "Y":
+            it.setBackground(GREEN)
+            return
+
+        f = try_parse_float(text)
+
+        # Priority 1: tolerance logic for data rows and columns > 0
+        if (row >= FIRST_DATA_ROW) and (col > 0):
+            nom, tol = self._get_nom_tol(col)
+            if (nom is not None) and (tol is not None) and (f is not None):
+                if abs(f - nom) <= tol:
+                    it.setBackground(BLUE)   # in tolerance band
+                else:
+                    it.setBackground(RED)    # out of tolerance
+                return
+
+        # Priority 2: legacy DELTA rule
+        if f is not None and f > DELTA:
+            it.setBackground(BLUE)
+            return
+
+        # Priority 3: generic
+        if has_letters(text):
+            it.setBackground(RED)
+        elif has_digits(text):
+            it.setBackground(GREEN)
         else:
-            fc, fr, tc, tr = 0, 0, self.sheet.ncols()-1, self.sheet.nrows()-1
+            it.setBackground(WHITE)
 
-        self.range_first_col = fc
+    def recolor_all(self):
+        try:
+            self.table.blockSignals(True)
+            for r in range(self.table.rowCount()):
+                for c in range(self.table.columnCount()):
+                    it = self.table.item(r, c)
+                    if it:
+                        self.recolor_cell(it, r, c)
+        finally:
+            self.table.blockSignals(False)
 
-        # на время массового заполнения «шапки» отключаем сигнал
-        self.head_table.blockSignals(True)
-
-        # ------ кол-во столбцов -----------------------------------------
-        n_cols = tc - fc + 1
-
-        # ------ заполняем head_table ------------------------------------
-        self.head_table.setColumnCount(n_cols)
-
-        for c in range(n_cols):
-            # номинал
-            nom_val = self.sheet[self.NOMINAL_ROW, fc + c].value
-            self.head_table.setItem(0, c, QTableWidgetItem(str(nom_val) if nom_val is not None else ''))
-            # допуск
-            tol_val = self.sheet[self.TOL_ROW, fc + c].value
-            self.head_table.setItem(1, c, QTableWidgetItem(str(tol_val) if tol_val is not None else ''))
-
-        self.head_table.blockSignals(False)
-
-        # ------ заполняем body_table ------------------------------------
-        data_start = self.TOL_ROW + 1
-        n_rows = tr - data_start + 1
-        if n_rows < 0:
-            n_rows = 0
-
-        self.body_table.setRowCount(n_rows)
-        self.body_table.setColumnCount(n_cols)
-
-        for r in range(n_rows):
-            for c in range(n_cols):
-                v = self.sheet[data_start + r, fc + c].value
-                item = QTableWidgetItem(str(v) if v is not None else '')
-                cell = self.sheet[data_start + r, fc + c]
-                style_info = get_cell_style(cell, self.ods_doc)
-
-                # Фон из файла (в GUI), перед перекраской правилами
-                if style_info['bg']:
-                    try:
-                        item.setBackground(QColor(style_info['bg']))
-                    except Exception:
-                        pass
-                # Цвет текста
-                if style_info['text_color']:
-                    try:
-                        item.setForeground(QColor(style_info['text_color']))
-                    except Exception:
-                        pass
-                # Жирный/курсив/подчёркнутый/размер
-                if style_info['bold']:
-                    f = item.font(); f.setBold(True); item.setFont(f)
-                if style_info['italic']:
-                    f = item.font(); f.setItalic(True); item.setFont(f)
-                if style_info['underline']:
-                    f = item.font(); f.setUnderline(True); item.setFont(f)
-                if style_info['fontsize']:
-                    f = item.font()
-                    try:
-                        f.setPointSize(int(float(style_info['fontsize'])))
-                    except Exception:
-                        pass
-                    item.setFont(f)
-
-                self.body_table.setItem(r, c, item)
-
-        # ------ первая глобальная проверка по допускам ------------------
-        for c in range(n_cols):
-            try:
-                tol = float(self.head_table.item(1, c).text())
-            except (TypeError, ValueError):
-                tol = None
-            if tol is not None:
-                self.body_table.recheck_column(c, tol)
-
-        # ------ второй проход: NM и Y для видимого диапазона -----------
-        for r in range(self.body_table.rowCount()):
-            for c in range(self.body_table.columnCount()):
-                it = self.body_table.item(r, c)
-                if not it:
-                    continue
-                up = it.text().strip().upper()
-                if up == "NM":
-                    it.setBackground(QColor("#000000"))
-                    it.setForeground(QColor("#FFFFFF"))
-                elif up == "Y":
-                    it.setBackground(GOOD)
-
-        self.range_first_col = fc      # пригодится при обратной записи допусков
-
-    def _on_head_changed(self, row, col):
-        if row != 1:
+    def recheck_column(self, col: int):
+        """Repaint entire column after nominal/tolerance change."""
+        if col <= 0:
+            return
+        nom, tol = self._get_nom_tol(col)
+        if nom is None or tol is None:
             return
         try:
-            tol = float(self.head_table.item(1, col).text())
-        except (TypeError, ValueError):
-            return
-
-        # пишем в таблицу (только видимый диапазон)
-        ods_col = self.range_first_col + col
-        self.sheet[self.TOL_ROW, ods_col].set_value(tol)
-
-        # перекрашиваем столбец в GUI
-        self.body_table.recheck_column(col, tol)
-
-    # ────────────────────────────────────────────────────────────────────
-    # СБРОС + ПОКРАСКА ВСЕГО ЛИСТА И СОХРАНЕНИЕ СТИЛЕЙ В ДОКУМЕНТ
-
-    def push_colors_back(self):
-        """
-        1) Сбрасываем ВСЕ цвета (фон и цвет текста) в зоне данных листа.
-        2) Снова красим по правилам:
-           - NM -> чёрный фон + белый текст
-           - Y  -> зелёный фон
-           - число: |value| <= tol ? зелёный : красный
-        """
-        sheet = self.sheet
-        doc   = self.ods_doc
-        if sheet is None:
-            return
-
-        ncols = sheet.ncols()
-        nrows = sheet.nrows()
-        data_start = self.TOL_ROW + 1
-
-        reset_cache = {}
-        paint_cache = {}
-
-        # заранее читаем допуски по всем столбцам (с учётом формул)
-        tol_per_col = [ods_number(sheet[self.TOL_ROW, c]) for c in range(ncols)]
-
-        # 1) СБРОС ЦВЕТОВ: фон -> белый, цвет текста -> по умолчанию
-        for c in range(ncols):
-            for r in range(data_start, nrows):
-                cell = sheet[r, c]
-                if getattr(cell, "style_name", None):
-                    new_name = clone_style_with_new_bg_clear_text(doc, cell.style_name, "#FFFFFF", reset_cache)
-                else:
-                    new_name = ensure_style(doc, "#FFFFFF", reset_cache)
-                set_cell_style_name(cell, new_name)
-
-        # 2) ПОКРАСКА ПО ПРАВИЛАМ
-        for c in range(ncols):
-            tol = tol_per_col[c]
-            for r in range(data_start, nrows):
-                cell = sheet[r, c]
-                val  = cell.value
-                text = (str(val).strip() if val is not None else "")
-                up   = text.upper()
-
-                # NM -> чёрный фон + белый текст
-                if up == "NM":
-                    bg_hex, text_hex = "#000000", "#FFFFFF"
-                    if getattr(cell, "style_name", None):
-                        name = clone_style_with_new_bg_text(doc, cell.style_name, bg_hex, text_hex, paint_cache)
-                    else:
-                        name = ensure_style_with_text(doc, bg_hex, text_hex, paint_cache)
-                    set_cell_style_name(cell, name)
+            self.table.blockSignals(True)
+            for r in range(FIRST_DATA_ROW, self.table.rowCount()):
+                it = self.table.item(r, col)
+                if it is None:
                     continue
+                self.recolor_cell(it, r, col)
+        finally:
+            self.table.blockSignals(False)
 
-                # Y -> зелёный фон
-                if up == "Y":
-                    bg_hex = "#C6EFCE"
-                    if getattr(cell, "style_name", None):
-                        name = clone_style_with_new_bg(doc, cell.style_name, bg_hex, paint_cache)
-                    else:
-                        name = ensure_style(doc, bg_hex, paint_cache)
-                    set_cell_style_name(cell, name)
-                    continue
+    # ---- UI callbacks ----
+    def build_table(self):
+        cols = max(self.sb_cols.value(), 1)
+        # ensure we have at least header rows
+        rows = max(self.sb_rows.value(), FIRST_DATA_ROW + 1)
+        try:
+            self.table.blockSignals(True)
+            self.table.setColumnCount(cols)
+            self.table.setRowCount(rows)
+            self.table.clearContents()
 
-                # Число: сравнение по модулю с допуском
-                vnum = ods_number(cell)
-                if vnum is None or tol is None:
-                    continue
+            for r in range(rows):
+                for c in range(cols):
+                    it = self.table.item(r, c)
+                    if it is None:
+                        it = QTableWidgetItem("")
+                        self.table.setItem(r, c, it)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setBackground(WHITE)
+        finally:
+            self.table.blockSignals(False)
 
-                bg_hex = "#C6EFCE" if abs(vnum) <= tol else "#FFC7CE"
-                if getattr(cell, "style_name", None):
-                    name = clone_style_with_new_bg(doc, cell.style_name, bg_hex, paint_cache)
-                else:
-                    name = ensure_style(doc, bg_hex, paint_cache)
-                set_cell_style_name(cell, name)
-
-    def save_as(self):
-        if not self.sheet:
+    def on_cell_changed(self, row, col):
+        # If nominal/tolerance edited, repaint entire column
+        if row in (NOMINAL_ROW, TOL_ROW):
+            self.recheck_column(col)
             return
+        it = self.table.item(row, col)
+        self.recolor_cell(it, row, col)
 
-        # 1) синхронизируем допуски из шапки (текущий видимый диапазон) в строку TOL_ROW
-        for c in range(self.head_table.columnCount()):
-            it = self.head_table.item(1, c)
-            if it is None:
-                continue
-            txt = (it.text() or "").strip()
-            try:
-                tol = float(txt)
-            except Exception:
-                continue
-            self.sheet[self.TOL_ROW, self.range_first_col + c].set_value(tol)
-
-        # 2) жёсткий сброс + покраска по правилам ВСЕГО листа
-        self.push_colors_back()
-
-        # 3) сохранить
-        suggested = re.sub(r'\.ods$', '', self.current_path, flags=re.I) + '_checked.ods'
-        path, _ = QFileDialog.getSaveFileName(self, 'Сохранить как…', suggested, 'ODS (*.ods)')
+    # ---- ODS I/O ----
+    def save_to_ods(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить как…", "table.ods", "ODS (*.ods)"
+        )
         if not path:
             return
-        if not path.lower().endswith('.ods'):
-            path += '.ods'
 
-        self.ods_doc.saveas(path)
+        doc = OpenDocumentSpreadsheet()
 
-# ────────────────────────────────────────────────────────────────────────
-# Точка входа
+        style_green = Style(name="bgGreen", family="table-cell")
+        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
+        doc.automaticstyles.addElement(style_green)
 
-if __name__ == '__main__':
+        style_red = Style(name="bgRed", family="table-cell")
+        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
+        doc.automaticstyles.addElement(style_red)
+
+        style_blue = Style(name="bgBlue", family="table-cell")
+        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
+        doc.automaticstyles.addElement(style_blue)
+
+        style_white = None  # default
+
+        t = Table(name="Sheet1")
+        doc.spreadsheet.addElement(t)
+
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+
+        for r in range(rows):
+            tr = TableRow()
+            t.addElement(tr)
+            for c in range(cols):
+                it = self.table.item(r, c)
+                text = it.text() if it else ""
+                bg = it.background().color() if it else WHITE
+
+                if bg == GREEN:
+                    stylename = style_green
+                elif bg == RED:
+                    stylename = style_red
+                elif bg == BLUE:
+                    stylename = style_blue
+                else:
+                    stylename = style_white
+
+                f = try_parse_float(text)
+                if f is not None:
+                    cell = TableCell(valuetype="float", value=f, stylename=stylename)
+                    cell.addElement(P(text=str(f)))
+                else:
+                    cell = TableCell(valuetype="string", stylename=stylename)
+                    cell.addElement(P(text=text))
+
+                tr.addElement(cell)
+
+        doc.save(path)
+        self.btn_save.setText("Сохранено ✓")
+
+    def open_ods(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "ODS (*.ods)")
+        if not path:
+            return
+
+        doc = load(path)
+        tables = doc.spreadsheet.getElementsByType(Table)
+        if not tables:
+            return
+        sheet = tables[0]
+
+        # 1) get content bounds instead of expanding repeated empties
+        content_rows, content_cols = _sheet_content_bounds(sheet)
+        if content_rows == 0 or content_cols == 0:
+            try:
+                self.table.blockSignals(True)
+                self.table.setUpdatesEnabled(False)
+                self.table.clearContents()
+                self.table.setRowCount(1)
+                self.table.setColumnCount(1)
+                self.sb_rows.setValue(1)
+                self.sb_cols.setValue(1)
+                it = QTableWidgetItem("")
+                it.setTextAlignment(Qt.AlignCenter)
+                it.setBackground(WHITE)
+                self.table.setItem(0, 0, it)
+            finally:
+                self.table.setUpdatesEnabled(True)
+                self.table.blockSignals(False)
+            return
+
+        # 2) cap by MAX_CELLS
+        est_cells = content_rows * content_cols
+        truncated = est_cells > MAX_CELLS
+        use_cols = content_cols
+        use_rows = content_rows if not truncated else max(1, MAX_CELLS // max(1, use_cols))
+
+        try:
+            self.table.blockSignals(True)
+            self.table.setUpdatesEnabled(False)
+
+            self.table.clearContents()
+            # Also ensure we still have header rows visible even if file is tiny
+            final_rows = max(use_rows, FIRST_DATA_ROW + 1)
+            self.table.setRowCount(final_rows)
+            self.table.setColumnCount(use_cols)
+            self.sb_rows.setValue(final_rows)
+            self.sb_cols.setValue(use_cols)
+
+            row_idx = 0
+            for row in sheet.getElementsByType(TableRow):
+                if row_idx >= use_rows:
+                    break
+                rrep = int(row.getAttribute('numberrowsrepeated') or 1)
+
+                # Build a visible template up to use_cols
+                template = []
+                col_idx = 0
+                for cell in row.getElementsByType(TableCell):
+                    crep = int(cell.getAttribute('numbercolumnsrepeated') or 1)
+                    vis = min(crep, max(0, use_cols - col_idx))
+                    if vis > 0:
+                        text = _extract_text_from_cell(cell)
+                        template.append((text, vis))
+                    col_idx += crep
+                    if col_idx >= use_cols:
+                        break
+
+                for _ in range(rrep):
+                    if row_idx >= use_rows:
+                        break
+                    c = 0
+                    for text, vis in template:
+                        for _k in range(vis):
+                            it = self.table.item(row_idx, c)
+                            if it is None:
+                                it = QTableWidgetItem("")
+                                self.table.setItem(row_idx, c, it)
+                            it.setTextAlignment(Qt.AlignCenter)
+                            it.setText(text)
+                            # we ignore external styles and recolor by our rules
+                            self.recolor_cell(it, row_idx, c)
+                            c += 1
+                            if c >= use_cols:
+                                break
+                        if c >= use_cols:
+                            break
+                    row_idx += 1
+
+            # Fill remaining rows (if we extended to ensure header presence)
+            for r in range(use_rows, final_rows):
+                for c in range(use_cols):
+                    it = self.table.item(r, c)
+                    if it is None:
+                        it = QTableWidgetItem("")
+                        self.table.setItem(r, c, it)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    it.setBackground(WHITE)
+
+        finally:
+            self.table.setUpdatesEnabled(True)
+            self.table.blockSignals(False)
+
+        if truncated:
+            QMessageBox.information(
+                self,
+                "Файл урезан",
+                f"Загружено {use_rows}×{use_cols} из {content_rows}×{content_cols} "
+                f"(лимит ≈ {MAX_CELLS:,} ячеек)."
+            )
+
+
+def main():
     app = QApplication(sys.argv)
-    win = ODSViewer()
-    win.show()
+    w = MiniOdsEditor()
+    w.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
