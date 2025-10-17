@@ -6,6 +6,7 @@ build/
 *.log
 *.pdf
 *.ods
+*.spec
 main0.py
 mainold.py
 maintest.py
