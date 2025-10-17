@@ -171,8 +171,8 @@ class MiniOdsEditor(QWidget):
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
 
-        self.btn_export_merged = QPushButton("PDF: таблица → брак → чертёж")
-        self.btn_export_merged.setToolTip("Склеить: таблица (1-й лист), затем лист 'Брак', затем выбранный чертёж")
+        self.btn_export_merged = QPushButton("PDF: таблица → чертёж → брак")
+        self.btn_export_merged.setToolTip("Склеить: таблица (1-й лист), затем выбранный чертёж, затем лист 'Брак'")
         self.btn_export_merged.clicked.connect(self.export_report_pdf)  # <-- новое имя!
         ctrl.addWidget(self.btn_export_merged)
 
@@ -824,15 +824,14 @@ class MiniOdsEditor(QWidget):
     
     def export_report_pdf(self):
         """
-        Жёсткий новый порядок:
+        НОВЫЙ порядок:
         1) таблица (одним листом),
-        2) 'Брак' + 'Итого брак' + служебный текст,
-        3) внешний PDF (чертёж) в конце (опционально).
+        2) внешний PDF (чертёж), если задан,
+        3) лист с информацией по браку и изменённым допускам.
         """
-        # Явная подсказка, что запускается НОВЫЙ экспорт
-        QMessageBox.information(self, "Экспорт", "Запущен новый экспорт: Таблица → Брак → Чертёж")
+        QMessageBox.information(self, "Экспорт", "Запущен экспорт: Таблица → Чертёж → Брак/Допуски")
 
-        # 0) чертёж (можно пропустить)
+        # 0) чертёж (опционален)
         in_path, _ = QFileDialog.getOpenFileName(self, "Выбери чертёж (PDF) — можно пропустить", "", "PDF Files (*.pdf)")
 
         out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "report.pdf", "PDF Files (*.pdf)")
@@ -845,7 +844,7 @@ class MiniOdsEditor(QWidget):
         fd2, tmp_bad_pdf = tempfile.mkstemp(suffix=".pdf"); os.close(fd2)
 
         try:
-            # шрифт и подгон
+            # крупный шрифт для экспорта
             try:
                 f = flat.font(); f.setPointSizeF(EXPORT_FONT_PT); flat.setFont(f)
             except Exception:
@@ -853,19 +852,16 @@ class MiniOdsEditor(QWidget):
             flat.resizeColumnsToContents()
             flat.resizeRowsToContents()
 
-            # 2) печать таблицы → tmp_tbl_pdf
+            # печать таблицы → tmp_tbl_pdf
             self._print_table_to_single_pdf(tmp_tbl_pdf, flat)
 
-            # 3) формируем 2-ю страницу (брак)
+            # формируем страницу «Брак/Допуски»
             bad_sns = _collect_defective_serials(self)
             bad_html = ", ".join(html.escape(x) for x in bad_sns) if bad_sns else "—"
             total_bad = len(bad_sns)
 
-            # имя текущего ods в шапку (добавим сохранение пути ниже)
             fname = os.path.basename(getattr(self, "current_file_path", "") or "")
             header = f"<p style='font-size:12pt;'><b>{html.escape(fname)}</b></p>" if fname else ""
-
-            #изменённые допуски
             changed_block = self._changed_tolerances_html()
 
             text_page_html = (
@@ -873,34 +869,40 @@ class MiniOdsEditor(QWidget):
                 "<h2>Брак:</h2>"
                 f"<p>{bad_html}</p>"
                 f"<p><b>Итого брак:</b> {total_bad}</p>"
-                + (changed_block or "") +   
+                + (changed_block or "") +
                 "<p><br/></p><p><br/></p>"
                 f"<p>{PDF_ABOUT_TEXT}</p>"
             )
             _render_textpage_to_pdf(self, tmp_bad_pdf, text_page_html)
 
-            # 4) Склейка: ТАБЛИЦА -> БРАК -> ЧЕРТЁЖ (если задан)
+            # Склейка в порядке: ТАБЛИЦА -> ЧЕРТЁЖ (если есть) -> БРАК/ДОПУСКИ
             writer = PdfWriter()
 
+            # Таблица
             r_tbl = PdfReader(tmp_tbl_pdf)
             for p in r_tbl.pages:
                 writer.add_page(p)
 
+            # Чертёж (все страницы)
+            if in_path:
+                try:
+                    r_in = PdfReader(in_path)
+                    if getattr(r_in, "is_encrypted", False):
+                        try:
+                            r_in.decrypt("")
+                        except Exception:
+                            QMessageBox.warning(self, "Чертёж пропущен", "Выбранный PDF зашифрован, пропускаю чертёж.")
+                            r_in = None
+                    if r_in:
+                        for p in r_in.pages:
+                            writer.add_page(p)
+                except Exception as e:
+                    QMessageBox.warning(self, "Чертёж пропущен", f"Не удалось прочитать чертёж:\n{e}")
+
+            # Брак/Допуски
             r_bad = PdfReader(tmp_bad_pdf)
             for p in r_bad.pages:
                 writer.add_page(p)
-
-            if in_path:
-                r_in = PdfReader(in_path)
-                if getattr(r_in, "is_encrypted", False):
-                    try:
-                        r_in.decrypt("")
-                    except Exception:
-                        QMessageBox.warning(self, "Ошибка", "Выбранный PDF зашифрован, пропускаю чертёж.")
-                        r_in = None
-                if r_in:
-                    for p in r_in.pages:
-                        writer.add_page(p)
 
             with open(out_path, "wb") as f:
                 writer.write(f)
