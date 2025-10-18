@@ -8,6 +8,11 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
+# xlsx
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
 # ODS
 from odf.opendocument import OpenDocumentSpreadsheet, load
 from odf.style import Style, TableCellProperties, TextProperties
@@ -48,7 +53,7 @@ FIRST_DATA_ROW = 6       # данные с 7-й строки
 MAX_CELLS = 300_000
 
 # ---- Export font size (для ODS и PDF) ----
-EXPORT_FONT_PT = 24.0   # меняй одно число: шрифт в сохраняемых файлах
+EXPORT_FONT_PT = 11.0   # меняй одно число: шрифт в сохраняемых файлах
 
 # ---- UI font size (только виджетам на экране) ----
 UI_FONT_PT = 10.0
@@ -168,8 +173,14 @@ class MiniOdsEditor(QWidget):
         self.btn_open = QPushButton("Открыть .ods"); self.btn_open.clicked.connect(self.open_ods)
         ctrl.addWidget(self.btn_open)
 
+        self.btn_open_xlsx = QPushButton("Открыть .xlsx"); self.btn_open_xlsx.clicked.connect(self.open_xlsx)
+        ctrl.addWidget(self.btn_open_xlsx)
+
         self.btn_save = QPushButton("Сохранить в .ods"); self.btn_save.clicked.connect(self.save_to_ods)
         ctrl.addWidget(self.btn_save)
+
+        self.btn_save_xlsx = QPushButton("Сохранить в .xlsx"); self.btn_save_xlsx.clicked.connect(self.save_to_xlsx)
+        ctrl.addWidget(self.btn_save_xlsx)
 
         self.btn_export_merged = QPushButton("PDF: таблица → чертёж → брак")
         self.btn_export_merged.setToolTip("Склеить: таблица (1-й лист), затем выбранный чертёж, затем лист 'Брак'")
@@ -234,7 +245,7 @@ class MiniOdsEditor(QWidget):
             lay.setSpacing(0)
             lay.setContentsMargins(0, 0, 0, 0)
 
-                # подпись для нижней строки ("Не в допуске")
+        # подпись для нижней строки ("Не в допуске")
         self.info_oos_caption = QTableWidget(1, 1, self)
         self.info_oos_caption.verticalHeader().setVisible(False)
         self.info_oos_caption.horizontalHeader().setVisible(False)
@@ -631,6 +642,24 @@ class MiniOdsEditor(QWidget):
         return "<h3>Изменённые допуски:</h3><ul>" + "".join(items) + "</ul>"
 
     # ---------- Coloring rules ----------
+    def _qcolor_to_xlsx_rgb(self, qc: QColor) -> str:
+        """
+        Возвращает 'RRGGBB' для openpyxl. QColor.name() даёт '#RRGGBB' — срежем '#'.
+        """
+        try:
+            return qc.name()[1:].upper()
+        except Exception:
+            return "FFFFFF"
+
+    def _cell_fill_for_bg(self, qc: QColor) -> PatternFill:
+        rgb = self._qcolor_to_xlsx_rgb(qc)
+        return PatternFill(fill_type="solid", start_color=rgb, end_color=rgb)
+
+    def _font_for_cell(self, fg: QColor) -> Font:
+        # шрифт экспорта + цвет текста
+        rgb = self._qcolor_to_xlsx_rgb(fg)
+        return Font(name="Arial", size=EXPORT_FONT_PT, color=rgb)
+
     def _get_tol(self, col):
         if col <= 0:
             return None
@@ -1775,38 +1804,39 @@ class MiniOdsEditor(QWidget):
         if not path: return
 
         self.current_file_path = path
-
-
-        #GREEN = QColor("#1A8830")   # soft green
-        #RED   = QColor("#8D1926")   # soft red
-        #BLUE  = QColor("#265C8F")   # kept for backward compat (открытие старых .ods)
-        #WHITE = QColor("#FFFFFF")
         
         doc = OpenDocumentSpreadsheet()
 
+
         # Общие текстовые настройки для ячеек (шрифт)
-        def _txt_props():
-            return TextProperties(fontsize=f"{EXPORT_FONT_PT}pt")
+        def _txt_props(color="#000000"):
+            return TextProperties(fontsize=f"{EXPORT_FONT_PT}pt", color=color)
 
         style_green = Style(name="cellGreen", family="table-cell")
-        style_green.addElement(TableCellProperties(backgroundcolor="#1A8830"))
-        style_green.addElement(_txt_props())
+        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
+        style_green.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_green)
 
         style_red = Style(name="cellRed", family="table-cell")
-        style_red.addElement(TableCellProperties(backgroundcolor="#8D1926"))
-        style_red.addElement(_txt_props())
+        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
+        style_red.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_red)
 
         style_blue = Style(name="cellBlue", family="table-cell")
-        style_blue.addElement(TableCellProperties(backgroundcolor="#265C8F"))
-        style_blue.addElement(_txt_props())
+        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
+        style_blue.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_blue)
 
         style_white = Style(name="cellWhite", family="table-cell")
         style_white.addElement(TableCellProperties(backgroundcolor="#FFFFFF"))
-        style_white.addElement(_txt_props())
+        style_white.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_white)
+
+        # НОВОЕ: чёрный фон + БЕЛЫЙ текст для NM
+        style_black = Style(name="cellBlack", family="table-cell")
+        style_black.addElement(TableCellProperties(backgroundcolor="#000000"))
+        style_black.addElement(_txt_props("#FFFFFF"))
+        doc.automaticstyles.addElement(style_black)
 
         t = Table(name="Sheet1"); doc.spreadsheet.addElement(t)
         
@@ -1820,6 +1850,7 @@ class MiniOdsEditor(QWidget):
                 if bg == GREEN:   stylename = style_green
                 elif bg == RED:   stylename = style_red
                 elif bg == BLUE:  stylename = style_blue
+                elif bg == BLACK: stylename = style_black 
                 else:             stylename = style_white  # теперь не None — чтобы применился размер шрифта
 
                 f = try_parse_float(text)
@@ -1840,7 +1871,7 @@ class MiniOdsEditor(QWidget):
 
         doc.save(path)
         self.setWindowTitle(f"Контроль допусков. Имя открытого файла:   {basename(path)}")
-        self.btn_save.setText("Сохранено ✓")
+        self.btn_save.setText("ODS Сохранено ✓")
 
     def open_ods(self):
         path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "ODS (*.ods)")
@@ -2090,6 +2121,194 @@ class MiniOdsEditor(QWidget):
             for r, was_hidden in enumerate(hidden_rows):
                 table.setRowHidden(r, was_hidden)
 
+
+    def open_xlsx(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть…", "", "Excel (*.xlsx)")
+        if not path:
+            return
+
+        self.current_file_path = path
+        self.setWindowTitle(f"Контроль допусков. Имя открытого файла:   {basename(path)}")
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            wb = load_workbook(path, data_only=True, read_only=True)
+            if not wb.sheetnames:
+                QMessageBox.warning(self, "Пусто", "В книге нет листов.")
+                return
+            ws = wb[wb.sheetnames[0]]
+
+            # Собираем буфер строк как str, аккуратно
+            rows_buf = []
+            max_used_cols = 0
+            last_content_row_idx = -1
+
+            # read_only worksheet -> iter_rows быстрый и не жрёт память как бегемот
+            for ridx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                # Приводим к строкам, но без ломания запятых/точек:
+                # openpyxl уже дал числа как float/int → строку через str(), для колонки 0 применим _fmt_serial
+                line = []
+                last_non_empty = -1
+                for cidx, v in enumerate(row, start=1):
+                    if v is None:
+                        s = ""
+                    else:
+                        if isinstance(v, float):
+                            # Excel хранит как float → строка с точкой; нам норм, дальше раскраска через try_parse_float
+                            s = str(v)
+                        elif isinstance(v, int):
+                            s = str(v)
+                        else:
+                            s = str(v)
+                    if s.strip() != "":
+                        last_non_empty = cidx - 1
+                    line.append(s)
+
+                useful_cols = last_non_empty + 1
+                if useful_cols > 0:
+                    last_content_row_idx = ridx - 1
+                    max_used_cols = max(max_used_cols, useful_cols)
+                    # обрежем «хвост» пустого справа
+                    line = line[:useful_cols]
+                    rows_buf.append(line)
+                else:
+                    rows_buf.append([])  # для согласования индексов
+
+            if max_used_cols <= 0:
+                # Вообще пусто — создадим минимальную таблицу
+                self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
+                try:
+                    self.table.clearContents()
+                    self.table.setRowCount(1); self.table.setColumnCount(1)
+                    self.sb_rows.setValue(1); self.sb_cols.setValue(1)
+                    it = QTableWidgetItem(""); it.setTextAlignment(Qt.AlignCenter); it.setBackground(WHITE)
+                    self.table.setItem(0, 0, it)
+                finally:
+                    self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+                return
+
+            needed_rows = max(last_content_row_idx + 1, FIRST_DATA_ROW + 1)
+            max_rows_by_cells = max(1, MAX_CELLS // max(1, max_used_cols))
+            use_rows = min(needed_rows, max_rows_by_cells)
+            truncated = use_rows < needed_rows
+            use_cols = max_used_cols
+
+            # Загрузка в QTableWidget
+            try:
+                self.table.blockSignals(True); self.table.setUpdatesEnabled(False)
+                self.table.clearContents()
+
+                final_rows = max(use_rows, FIRST_DATA_ROW + 1)
+                self.table.setRowCount(final_rows)
+                self.table.setColumnCount(use_cols)
+                self.sb_rows.setValue(final_rows)
+                self.sb_cols.setValue(use_cols)
+
+                for r in range(use_rows):
+                    row_vals = rows_buf[r] if r < len(rows_buf) else []
+                    for c in range(use_cols):
+                        raw = row_vals[c] if c < len(row_vals) else ""
+                        # кол.0 — серийник «283.0» → «283»
+                        txt = _fmt_serial(raw) if c == 0 else raw
+                        it = self.table.item(r, c)
+                        if it is None:
+                            it = QTableWidgetItem("")
+                            self.table.setItem(r, c, it)
+                        it.setTextAlignment(Qt.AlignCenter)
+                        it.setText(txt)
+                        it.setBackground(WHITE)
+            finally:
+                self.table.setUpdatesEnabled(True); self.table.blockSignals(False)
+
+            # Синхронизация и пересчёты (как в open_ods)
+            self._apply_service_row_visibility()
+            if self.table.columnCount() > 0:
+                self.table.setColumnHidden(0, True)
+
+            self._ensure_panel_cols()
+            self._sync_header_from_main()
+            self._sync_tol_from_main()
+            self._rebuild_tol_cache()
+            self._sync_info_main_from_main()
+            self._sync_order_row()
+            self.table.horizontalScrollBar().setValue(0)
+            self.order_table.horizontalScrollBar().setValue(0)
+            self.recolor_all()
+            self._recompute_oos_counts()
+            self._sync_bars_and_captions_height()
+            self._recompute_total_defects()
+            self._snapshot_orig_tolerances()
+
+            if truncated:
+                QMessageBox.information(
+                    self, "Файл урезан",
+                    f"Загружено {use_rows}×{use_cols} (лимит ≈ {MAX_CELLS:,} ячеек)."
+                )
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось открыть XLSX:\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def save_to_xlsx(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", "table.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+
+        rows = self.table.rowCount()
+        cols = self.table.columnCount()
+
+        # Пишем значения и минимальную стилизацию: фон и цвет текста
+        for r in range(rows):
+            for c in range(cols):
+                it = self.table.item(r, c)
+                txt = (it.text() if it else "") or ""
+
+                # Значение: пытаемся сохранить число числом; иначе строку
+                f = try_parse_float(txt)
+                if f is not None:
+                    val = int(round(f)) if (abs(f - int(round(f))) < 1e-9) else float(f)
+                else:
+                    val = txt
+
+                cell = ws.cell(row=r+1, column=c+1, value=val)
+
+                # Выравнивание по центру, как в UI
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
+                # Фон и шрифт
+                bg = (it.background().color() if it else WHITE)
+                fg = (it.foreground().color() if it else TEXT)
+
+                # QColor может быть не полностью инициализирован — подстрахуем
+                try:
+                    cell.fill = self._cell_fill_for_bg(bg)
+                except Exception:
+                    pass
+                try:
+                    cell.font = self._font_for_cell(fg)
+                except Exception:
+                    pass
+
+        # Немного ширины для читаемости
+        for c in range(1, cols+1):
+            ws.column_dimensions[get_column_letter(c)].width = max(10, min(50, self.table.columnWidth(c-1) // 7 or 12))
+
+        # Высоты строк примерные
+        #for r in range(1, rows+1):
+        #    ws.row_dimensions[r].height = max(14, min(120, self.table.rowHeight(r-1) * 0.75))
+
+        try:
+            wb.save(path)
+            self.current_file_path = path
+            self.setWindowTitle(f"Контроль допусков. Имя открытого файла:   {basename(path)}")
+            self.btn_save_xlsx.setText("XLSX Сохранено ✓")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить XLSX:\n{e}")
 
 def main():
     app = QApplication(sys.argv)
