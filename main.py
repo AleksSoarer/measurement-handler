@@ -549,8 +549,6 @@ class MiniOdsEditor(QWidget):
     def _is_numeric_tol_text(self, s: str) -> bool:
         return bool(self._NUM_ONLY_RE.fullmatch((s or '').strip()))
     
-
-
     def _contains_letters(self, s: str) -> bool:
         return any(ch.isalpha() for ch in (s or ""))
 
@@ -791,6 +789,27 @@ class MiniOdsEditor(QWidget):
         # пустая строка измерений — брак
         return not has_any_value
     
+    # ==== default name helpers ====
+    def _default_basename(self) -> str:
+        """
+        Берём имя текущего файла без расширения.
+        Если в конце есть _revXY (XY = буквы/цифры), отрезаем.
+        """
+        path = getattr(self, "current_file_path", "") or ""
+        base = os.path.splitext(os.path.basename(path))[0] if path else ""
+        if base:
+            base = re.sub(r'(?i)(_rev[0-9a-z]+)$', '', base)  # срежем только хвостовой _revXY
+        return base or "table"
+
+    def _suggest_save_path(self, ext: str, fallback: str) -> str:
+        """
+        Собираем полный путь для диалога сохранения:
+        папка = папка исходника (если есть), имя = _default_basename + ext.
+        """
+        directory = os.path.dirname(getattr(self, "current_file_path", "") or "")
+        name = f"{self._default_basename()}{ext}"
+        full = os.path.join(directory, name) if directory else name
+        return full or fallback
 
     def _print_widget_to_single_pdf(self, pdf_path, widget):
         """Печатает ЛЮБОЙ контейнер (со всеми дочерними) в один лист PDF.
@@ -848,10 +867,6 @@ class MiniOdsEditor(QWidget):
             except Exception:
                 pass
 
-
-
-
-    
     def export_report_pdf(self):
         """
         НОВЫЙ порядок:
@@ -862,9 +877,12 @@ class MiniOdsEditor(QWidget):
         QMessageBox.information(self, "Экспорт", "Запущен экспорт: Таблица → Чертёж → Брак/Допуски")
 
         # 0) чертёж (опционален)
-        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери чертёж (PDF) — можно пропустить", "", "PDF Files (*.pdf)")
+        start_dir = os.path.dirname(getattr(self, "current_file_path", "") or "")
+        in_path, _ = QFileDialog.getOpenFileName(self, "Выбери чертёж (PDF) — можно пропустить",
+                                                start_dir, "PDF Files (*.pdf)")
+        out_default = self._suggest_save_path(".pdf", "report.pdf")
+        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", out_default, "PDF Files (*.pdf)")
 
-        out_path, _ = QFileDialog.getSaveFileName(self, "Сохранить как...", "report.pdf", "PDF Files (*.pdf)")
         if not out_path:
             return
 
@@ -1055,10 +1073,6 @@ class MiniOdsEditor(QWidget):
             table.resize(old_size)
             table.setHorizontalScrollBarPolicy(old_hpol)
             table.setVerticalScrollBarPolicy(old_vpol)
-
-
-   
-
 
     def _expand_children_for_print(self, root_widget):
         """Убираем скроллы и растягиваем виджеты, чтобы в PDF попал весь контент."""
@@ -1800,7 +1814,8 @@ class MiniOdsEditor(QWidget):
 
     # ---------- ODS I/O ----------
     def save_to_ods(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", "table.ods", "ODS (*.ods)")
+        default_name = self._suggest_save_path(".ods", "table.ods")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", default_name, "ODS (*.ods)")
         if not path: return
 
         self.current_file_path = path
@@ -2251,7 +2266,8 @@ class MiniOdsEditor(QWidget):
             QApplication.restoreOverrideCursor()
 
     def save_to_xlsx(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", "table.xlsx", "Excel (*.xlsx)")
+        default_name = self._suggest_save_path(".xlsx", "table.xlsx")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить как…", default_name, "Excel (*.xlsx)")
         if not path:
             return
 
