@@ -350,8 +350,7 @@ class MiniOdsEditor(QWidget):
         # Horizontal: sync center header/tolerance with main
         self.table.horizontalScrollBar().valueChanged.connect(self.header_table.horizontalScrollBar().setValue)
         self.table.horizontalScrollBar().valueChanged.connect(self.tolerance_table.horizontalScrollBar().setValue)
-        #self.header_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
-        #self.tolerance_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
+
         # Горизонтальный скролл: main <-> order_row
         self.table.horizontalScrollBar().valueChanged.connect(self.order_table.horizontalScrollBar().setValue)
         self.order_table.horizontalScrollBar().valueChanged.connect(self.table.horizontalScrollBar().setValue)
@@ -464,16 +463,18 @@ class MiniOdsEditor(QWidget):
     _NUM_DOT_NUM_RE = re.compile(r'^[0-9]+\.[0-9]+$')
     _INT_RE = re.compile(r'^[0-9]+$')
 
-    _NUM_ONLY_RE   = re.compile(r'^\d+(?:\.\d+)?$', re.ASCII)  # 12 или 12.34
-    _NUM_SLASH_RE  = re.compile(r'^\s*\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?\s*$', re.ASCII)
+    _NUM_ONLY_RE   = re.compile(r'^\d+(?:[.,]\d+)?$', re.ASCII)  # 12 или 12.34 / 12,34
+    _NUM_SLASH_RE  = re.compile(r'^\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*$', re.ASCII)
 
     # Токен калибра: буква+цифры ИЛИ цифры+буква; допускаем латиницу/кириллицу
     _FIT_TOKEN     = r'(?:[A-Za-zА-Яа-я]\d+|\d+[A-Za-zА-Яа-я])'
     _SYM_PAIR_RE   = re.compile(rf'^\s*{_FIT_TOKEN}(?:[ /]{_FIT_TOKEN})?\s*$', re.IGNORECASE)
 
     # Отображаемая нами декорация "old (ОПП new)" — чтобы уметь её распознать при редактировании
-    _OPP_DECOR_RE  = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s*\(\s*ОПП\s*([0-9]+(?:\.[0-9]+)?)\s*\)\s*$', re.IGNORECASE)
-
+    _OPP_DECOR_RE  = re.compile(
+        r'^\s*([0-9]+(?:[.,][0-9]+)?)\s*\(\s*ОПП\s*([0-9]+(?:[.,][0-9]+)?)\s*\)\s*$',
+        re.IGNORECASE
+    )
 
     # НОВОЕ: диапазон чисел через дефис/тире: "0.1-0.2", "0,1 – 0,2" и т.п.
     _NUM_RANGE_RE = re.compile(
@@ -482,17 +483,15 @@ class MiniOdsEditor(QWidget):
 
     def _extract_tol_kind_and_value(self, s: str):
         """
-        Возвращает (kind, value):
-        kind ∈ {'empty','numeric','slash','symbolic','invalid'}
-        value: для numeric — число-строка с точкой; для остальных — нормализованный ввод.
-        При виде 'old (ОПП new)' берём new как эффективный ввод.
+        ('empty'|'numeric'|'slash'|'symbolic'|'invalid', value_str_as_typed)
+        Для 'old (ОПП new)' вернёт ('numeric', new_as_typed).
         """
         s = (s or '').strip()
         if not s:
             return ('empty', '')
         m = self._OPP_DECOR_RE.fullmatch(s)
         if m:
-            return ('numeric', m.group(2))  # пользователь не вводил ОПП, это наша декорация
+            return ('numeric', m.group(2))
         if self._NUM_ONLY_RE.fullmatch(s):
             return ('numeric', s)
         if self._NUM_SLASH_RE.fullmatch(s):
@@ -538,22 +537,24 @@ class MiniOdsEditor(QWidget):
 
     def _is_numeric_tol_text(self, s: str) -> bool:
         return bool(self._NUM_ONLY_RE.fullmatch((s or '').strip()))
+    
+
 
     def _contains_letters(self, s: str) -> bool:
         return any(ch.isalpha() for ch in (s or ""))
 
     def _tol_current_part(self, s: str) -> str:
-        """Числовой current для расчётов: из 'old (ОПП new)' берём new; иначе само число."""
+        """Для расчётов: из 'old (ОПП new)' берём new; иначе число; возвращаем с точкой."""
         s = (s or "").strip()
         m = self._OPP_DECOR_RE.fullmatch(s)
         if m:
-            return self._normalize_to_xdoty(m.group(2))
+            return self._normalize_to_xdoty(m.group(2))  # нормализуем только ДЛЯ расчёта
         if self._NUM_ONLY_RE.fullmatch(s):
             return self._normalize_to_xdoty(s)
         return ""
 
     def _tol_base_left_part(self, s: str) -> str:
-        """Базовый old из левой части декорации, либо само число, если ОПП нет."""
+        """Левая часть (old) из нашей декорации; иначе число; возвращаем с точкой."""
         s = (s or "").strip()
         m = self._OPP_DECOR_RE.fullmatch(s)
         if m:
@@ -1317,7 +1318,6 @@ class MiniOdsEditor(QWidget):
         self._sync_bars_and_captions_height()
         self._apply_tol_highlight()
 
-
     def _snapshot_orig_tolerances(self):
         cols = self.table.columnCount()
         self._orig_tol_texts = []
@@ -1328,12 +1328,13 @@ class MiniOdsEditor(QWidget):
             raw = (it.text().strip() if it else "")
 
             if self._is_numeric_or_decorated_tol(raw):
-                base = self._tol_base_left_part(raw) or self._tol_current_part(raw)
-                cur  = self._tol_current_part(raw) or base
-                self._orig_tol_texts.append(base or "")
-                display = self._format_tol_with_opp(cur, c) if cur else (base or "")
+                # сохраняем "old" в ВИДЕ, как он показан (для красоты),
+                # но численные сравнения делаем через try_parse_float(...)
+                m = self._OPP_DECOR_RE.fullmatch(raw)
+                old_disp = m.group(1) if m else raw
+                self._orig_tol_texts.append(old_disp)
+                display = raw  # ничего не меняем в UI
             else:
-                # нечисловой столбец
                 self._nonnumeric_tol_cols.add(c)
                 self._orig_tol_texts.append(raw)
                 display = raw
@@ -1554,6 +1555,18 @@ class MiniOdsEditor(QWidget):
             self.order_table.horizontalScrollBar().setValue(0)
             self._snapshot_orig_tolerances()
 
+    def _format_tol_with_opp_display(self, new_display_str: str, col: int) -> str:
+        """
+        Строит отображение допусков, уважая исходный формат пользователя.
+        Если new == old по числу — возвращает просто old.
+        """
+        old_disp = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
+        # сравниваем по числам, а не по строкам
+        old_num = try_parse_float(old_disp)
+        new_num = try_parse_float(new_display_str)
+        if old_num is not None and new_num is not None and abs(old_num - new_num) < 1e-12:
+            return old_disp or new_display_str
+        return f"{old_disp} (ОПП {new_display_str})" if old_disp else new_display_str
 
     def _format_tol_with_opp(self, cur_txt: str, col: int) -> str:
         """Показываем: 'old (ОПП new)'; если old==new — только 'old'."""
@@ -1576,9 +1589,9 @@ class MiniOdsEditor(QWidget):
         txt = (raw_in or "").strip()
         prev = self.table.item(TOL_ROW, col).text() if self.table.item(TOL_ROW, col) else ""
 
-        kind, val = self._extract_tol_kind_and_value(txt)
+        kind, val_disp = self._extract_tol_kind_and_value(txt)
 
-        # пустое — просто откат к прежнему отображению
+        # пусто -> откат
         if kind == 'empty':
             it_top = self.tolerance_table.item(0, col) or QTableWidgetItem("")
             if self.tolerance_table.item(0, col) is None:
@@ -1586,7 +1599,7 @@ class MiniOdsEditor(QWidget):
             it_top.setText(prev)
             return
 
-        # мусор — откат и предупреждение, ничего не сохраняем
+        # мусор -> откат + предупреждение
         if kind == 'invalid':
             it_top = self.tolerance_table.item(0, col) or QTableWidgetItem("")
             if self.tolerance_table.item(0, col) is None:
@@ -1596,8 +1609,8 @@ class MiniOdsEditor(QWidget):
             QMessageBox.warning(
                 self, "Неверный формат допуска",
                 "Разрешены только:\n"
-                "• число с точкой: 0.15\n"
-                "• два числа через слэш: 0.10/0.25\n"
+                "• число (с точкой или запятой), например: 0.15 или 0,15\n"
+                "• два числа через слэш: 0.10/0.25 или 0,10/0,25\n"
                 "• калибры: D6, 6H, D6 7H, D9/6H"
             )
             return
@@ -1605,7 +1618,7 @@ class MiniOdsEditor(QWidget):
         # символика и 'a/b' — не анализируем численно
         if kind in ('slash', 'symbolic'):
             self._nonnumeric_tol_cols.add(col)
-            disp = val  # сохраняем как ввели
+            disp = val_disp  # как ввёл человек
 
             it = self.table.item(TOL_ROW, col) or QTableWidgetItem("")
             if self.table.item(TOL_ROW, col) is None:
@@ -1629,25 +1642,22 @@ class MiniOdsEditor(QWidget):
             self._recompute_total_defects()
             return
 
-        # numeric — включаем автодекорацию «old (ОПП new)»
+        # numeric — включаем автодекор с сохранением ВИДА
         if kind == 'numeric':
             self._nonnumeric_tol_cols.discard(col)
 
-            # old берём из снапшота; если его нет — считаем текущий как базовый
-            old_val = self._normalize_to_xdoty(self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else "")
-            new_val = self._normalize_to_xdoty(val)
+            old_disp = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
+            new_disp = val_disp  # как ввёл пользователь (с точкой ИЛИ запятой)
 
-            if not old_val:
-                # впервые задают допуск — фиксируем базовый
+            if not old_disp:
+                # впервые задают допуск в колонке: фиксируем как базовый "old"
                 if col >= len(self._orig_tol_texts):
                     self._orig_tol_texts.extend([""] * (col + 1 - len(self._orig_tol_texts)))
-                self._orig_tol_texts[col] = new_val
-                display = new_val
+                self._orig_tol_texts[col] = new_disp
+                display = new_disp
             else:
-                # если равны — показываем только old, иначе old (ОПП new)
-                display = self._format_tol_with_opp(new_val, col)
+                display = self._format_tol_with_opp_display(new_disp, col)
 
-            # записываем отображение в обе таблицы
             it = self.table.item(TOL_ROW, col) or QTableWidgetItem("")
             if self.table.item(TOL_ROW, col) is None:
                 self.table.setItem(TOL_ROW, col, it)
@@ -1664,7 +1674,7 @@ class MiniOdsEditor(QWidget):
 
             self._rebuild_tol_cache()
             self.recheck_column(col)
-            self._mark_tol_change(col)   # жёлтая подсветка «изменён допуск»
+            self._mark_tol_change(col)
             self._recompute_oos_counts()
             self._recompute_total_defects()
 
