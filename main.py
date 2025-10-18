@@ -10,7 +10,7 @@ from PyQt5.QtGui import QColor
 
 # xlsx
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ODS
@@ -1827,28 +1827,30 @@ class MiniOdsEditor(QWidget):
         def _txt_props(color="#000000"):
             return TextProperties(fontsize=f"{EXPORT_FONT_PT}pt", color=color)
 
-        style_green = Style(name="cellGreen", family="table-cell")
+        # БАЗОВЫЙ стиль с чёрной рамкой
+        style_base = Style(name="cellBase", family="table-cell")
+        style_base.addElement(TableCellProperties(border="0.5pt solid #808080"))
+        style_base.addElement(_txt_props("#000000"))
+        doc.automaticstyles.addElement(style_base)
+
+        style_green = Style(name="cellGreen", family="table-cell", parentstylename="cellBase")
         style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
-        style_green.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_green)
 
-        style_red = Style(name="cellRed", family="table-cell")
+        style_red = Style(name="cellRed", family="table-cell", parentstylename="cellBase")
         style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
-        style_red.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_red)
 
-        style_blue = Style(name="cellBlue", family="table-cell")
+        style_blue = Style(name="cellBlue", family="table-cell", parentstylename="cellBase")
         style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
-        style_blue.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_blue)
 
-        style_white = Style(name="cellWhite", family="table-cell")
+        style_white = Style(name="cellWhite", family="table-cell", parentstylename="cellBase")
         style_white.addElement(TableCellProperties(backgroundcolor="#FFFFFF"))
-        style_white.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_white)
 
-        # НОВОЕ: чёрный фон + БЕЛЫЙ текст для NM
-        style_black = Style(name="cellBlack", family="table-cell")
+        # ЧЁРНЫЙ ФОН + БЕЛЫЙ ТЕКСТ для NM, рамка берётся из base
+        style_black = Style(name="cellBlack", family="table-cell", parentstylename="cellBase")
         style_black.addElement(TableCellProperties(backgroundcolor="#000000"))
         style_black.addElement(_txt_props("#FFFFFF"))
         doc.automaticstyles.addElement(style_black)
@@ -2278,6 +2280,13 @@ class MiniOdsEditor(QWidget):
         rows = self.table.rowCount()
         cols = self.table.columnCount()
 
+        thin_black = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000"),
+)
+        
         # Пишем значения и минимальную стилизацию: фон и цвет текста
         for r in range(rows):
             for c in range(cols):
@@ -2300,6 +2309,7 @@ class MiniOdsEditor(QWidget):
                 bg = (it.background().color() if it else WHITE)
                 fg = (it.foreground().color() if it else TEXT)
 
+                cell.border = thin_black
                 # QColor может быть не полностью инициализирован — подстрахуем
                 try:
                     cell.fill = self._cell_fill_for_bg(bg)
