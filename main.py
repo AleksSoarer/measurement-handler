@@ -1827,31 +1827,44 @@ class MiniOdsEditor(QWidget):
         def _txt_props(color="#000000"):
             return TextProperties(fontsize=f"{EXPORT_FONT_PT}pt", color=color)
 
-        # БАЗОВЫЙ стиль с чёрной рамкой
-        style_base = Style(name="cellBase", family="table-cell")
-        style_base.addElement(TableCellProperties(border="0.5pt solid #808080"))
-        style_base.addElement(_txt_props("#000000"))
-        doc.automaticstyles.addElement(style_base)
+        # ЯВНЫЕ бордеры для каждой стороны. LibreOffice так надёжнее.
+        BORDER_SPEC = "0.75pt solid #808080"
 
-        style_green = Style(name="cellGreen", family="table-cell", parentstylename="cellBase")
-        style_green.addElement(TableCellProperties(backgroundcolor="#C6EFCE"))
+        def _cellprops(bg=None):
+            kw = {
+                "bordertop":    BORDER_SPEC,
+                "borderbottom": BORDER_SPEC,
+                "borderleft":   BORDER_SPEC,
+                "borderright":  BORDER_SPEC,
+            }
+            if bg:
+                kw["backgroundcolor"] = bg
+            return TableCellProperties(**kw)
+
+        # Стили ячеек: каждый со своими бордерами
+        style_green = Style(name="cellGreen", family="table-cell")
+        style_green.addElement(_cellprops("#C6EFCE"))
+        style_green.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_green)
 
-        style_red = Style(name="cellRed", family="table-cell", parentstylename="cellBase")
-        style_red.addElement(TableCellProperties(backgroundcolor="#FFC7CE"))
+        style_red = Style(name="cellRed", family="table-cell")
+        style_red.addElement(_cellprops("#FFC7CE"))
+        style_red.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_red)
 
-        style_blue = Style(name="cellBlue", family="table-cell", parentstylename="cellBase")
-        style_blue.addElement(TableCellProperties(backgroundcolor="#9DC3E6"))
+        style_blue = Style(name="cellBlue", family="table-cell")
+        style_blue.addElement(_cellprops("#9DC3E6"))
+        style_blue.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_blue)
 
-        style_white = Style(name="cellWhite", family="table-cell", parentstylename="cellBase")
-        style_white.addElement(TableCellProperties(backgroundcolor="#FFFFFF"))
+        style_white = Style(name="cellWhite", family="table-cell")
+        style_white.addElement(_cellprops("#FFFFFF"))
+        style_white.addElement(_txt_props("#000000"))
         doc.automaticstyles.addElement(style_white)
 
-        # ЧЁРНЫЙ ФОН + БЕЛЫЙ ТЕКСТ для NM, рамка берётся из base
-        style_black = Style(name="cellBlack", family="table-cell", parentstylename="cellBase")
-        style_black.addElement(TableCellProperties(backgroundcolor="#000000"))
+        # NM: чёрный фон + белый текст + те же бордеры
+        style_black = Style(name="cellBlack", family="table-cell")
+        style_black.addElement(_cellprops("#000000"))
         style_black.addElement(_txt_props("#FFFFFF"))
         doc.automaticstyles.addElement(style_black)
 
@@ -1864,11 +1877,13 @@ class MiniOdsEditor(QWidget):
                 it = self.table.item(r, c)
                 text = it.text() if it else ""
                 bg = it.background().color() if it else WHITE
-                if bg == GREEN:   stylename = style_green
-                elif bg == RED:   stylename = style_red
-                elif bg == BLUE:  stylename = style_blue
-                elif bg == BLACK: stylename = style_black 
-                else:             stylename = style_white  # теперь не None — чтобы применился размер шрифта
+                hexbg = bg.name().upper() if hasattr(bg, "name") else "#FFFFFF"
+
+                if   hexbg == "#C6EFCE": stylename = style_green
+                elif hexbg == "#FFC7CE": stylename = style_red
+                elif hexbg == "#9DC3E6": stylename = style_blue
+                elif hexbg == "#000000": stylename = style_black
+                else:                    stylename = style_white
 
                 f = try_parse_float(text)
                 if f is not None:
