@@ -122,7 +122,7 @@ def try_parse_float(s: str):
     up = s.upper()
     if up in ("Y", "N", "Z", "NM"):
         return None
-    candidate = s.replace(',', '.')
+    candidate = s.replace('−', '-').replace(',', '.')
     try:
         return float(candidate)
     except ValueError:
@@ -191,6 +191,7 @@ class MiniOdsEditor(QWidget):
         root.addLayout(ctrl)
 
         self._nonnumeric_tol_cols = set()  # столбцы с «D9/6H…» — не анализируем
+        self._slash_tol = {}
 
         # ======= TOP PANELS =======
         # left fixed header info (rows 1–2 of col0)
@@ -466,6 +467,33 @@ class MiniOdsEditor(QWidget):
 
     #------- Хэлперы для контроля допусков -------
 
+    # ==== Slash tolerance helpers (внутри MiniOdsEditor) ====
+    @staticmethod
+    def _tof(s: str) -> float:
+        return float(str(s).strip().replace('−', '-').replace(',', '.'))
+
+    def _parse_slash_tolerance(self, tol_str: str):
+        """
+        ' -0,025/-0,05 ' -> ( -0.05, -0.025 )  # по возрастанию
+        """
+        s = (tol_str or '').strip().replace(' ', '')
+        m = re.fullmatch(fr'({self._NUM_RE})[\\/]({self._NUM_RE})', s)
+        if not m:
+            raise ValueError(f"Некорректный формат допуска через слеш: {tol_str!r}")
+        d1, d2 = self._tof(m.group(1)), self._tof(m.group(2))
+        return (d1, d2) if d1 <= d2 else (d2, d1)
+
+    def _check_delta_with_slash_pair(self, delta: float, dev_pair):
+        """
+        delta — значение отклонения из ячейки (например, -0.12)
+        dev_pair — (lo, hi) из 'a/b', отсортированы по возрастанию
+        """
+        lo, hi = dev_pair
+        return lo <= delta <= hi
+    
+    def _check_value_with_slash_pair(self, nominal: float, value: float, dev_pair):
+        return self._check_delta_with_slash_pair(value, dev_pair)
+
     # --- ОПП-хелперы (внутри класса MiniOdsEditor) ---
     _OPP_RE = re.compile(
         r'^\s*([0-9]+(?:[.,][0-9]+)?)(?:\s*\(\s*ОПП\s*([0-9]+(?:[.,][0-9]+)?)\s*\))?\s*$',
@@ -475,7 +503,10 @@ class MiniOdsEditor(QWidget):
     _INT_RE = re.compile(r'^[0-9]+$')
 
     _NUM_ONLY_RE   = re.compile(r'^\d+(?:[.,]\d+)?$', re.ASCII)  # 12 или 12.34 / 12,34
-    _NUM_SLASH_RE  = re.compile(r'^\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*$', re.ASCII)
+    _NUM_SLASH_RE  = re.compile(
+        r'^\s*[-−]?\d+(?:[.,]\d+)?\s*[\\/]\s*[-−]?\d+(?:[.,]\d+)?\s*$'
+    )
+    _NUM_RE = r'[-−]?\d+(?:[.,]\d+)?'
 
     # Токен калибра: буква+цифры ИЛИ цифры+буква; допускаем латиницу/кириллицу
     _FIT_TOKEN     = r'(?:[A-Za-zА-Яа-я]\d+|\d+[A-Za-zА-Яа-я])'
@@ -696,9 +727,22 @@ class MiniOdsEditor(QWidget):
 
             # числа и допуски
             f = try_parse_float(text)
-            if (row >= FIRST_DATA_ROW) and (col > 0):
+            if (row >= FIRST_DATA_ROW) and (col > 0) and f is not None:
+                # 1) слэш-допуск (значение — абсолютное, сравниваем с номиналом)
+                pair = self._slash_tol.get(col)
+                if pair is not None:
+                    nom_txt = (self.table.item(NOMINAL_ROW, col).text() if self.table.item(NOMINAL_ROW, col) else "")
+                    nom = try_parse_float(nom_txt)
+                    if nom is not None:
+                        ok = self._check_value_with_slash_pair(nom, f, pair)
+                        it.setBackground(BLUE if ok else RED)
+                        it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
+                        return
+                    # если номинала нет — падаем в старую логику/фолбэк
+
+                # 2) скалярный допуск (старое поведение: считаем, что в ячейке уже Δ)
                 tol = self._get_tol(col)
-                if tol is not None and f is not None:
+                if tol is not None:
                     it.setBackground(BLUE if abs(f) <= tol else RED)
                     it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
                     return
@@ -738,16 +782,32 @@ class MiniOdsEditor(QWidget):
 
     def _rebuild_tol_cache(self):
         cols = self.table.columnCount()
-        self._tol_cache = [None] * cols
+        self._tol_cache = [None] * cols     # скалярные допуски (старое поведение)
+        self._slash_tol = {}                # НОВОЕ: пары отклонений для слэша
+
         for c in range(cols):
             if c == 0:
                 continue
             it = self.table.item(TOL_ROW, c)
-            raw = (it.text() if it else "") or ""
+            raw = ((it.text() if it else "") or "").strip()
+
+            # 1) Слэш-формат "num/num" — анализируем
+            if self._NUM_SLASH_RE.fullmatch(raw):
+                try:
+                    self._slash_tol[c] = self._parse_slash_tolerance(raw)
+                    self._nonnumeric_tol_cols.discard(c)  # это НЕ «символика»
+                except Exception:
+                    # если парс не удался — пусть колонка вообще не считается численно
+                    self._nonnumeric_tol_cols.add(c)
+                continue
+
+            # 2) Символика/диапазоны/прочее — как раньше
             if c in self._nonnumeric_tol_cols:
                 self._tol_cache[c] = None
                 continue
-            cur = self._tol_current_part(raw)   # берём new (из скобок)
+
+            # 3) Чисто числовой или "old (ОПП new)" — старое поведение
+            cur = self._tol_current_part(raw)   # берём new (из скобок), если есть
             self._tol_cache[c] = try_parse_float(cur) if cur else None
 
     
@@ -782,9 +842,16 @@ class MiniOdsEditor(QWidget):
             # числа -> проверяем по допуску
             f = try_parse_float(txt)
             if f is not None:
-                tol = self._get_tol(c)
-                if tol is not None and abs(f) > tol:
-                    return True
+                pair = self._slash_tol.get(c)
+                if pair is not None:
+                    nom_txt = (self.table.item(NOMINAL_ROW, c).text() if self.table.item(NOMINAL_ROW, c) else "")
+                    nom = try_parse_float(nom_txt)
+                    if nom is not None and not self._check_value_with_slash_pair(nom, f, pair):
+                        return True
+                else:
+                    tol = self._get_tol(c)
+                    if tol is not None and abs(f) > tol:
+                        return True
 
         # пустая строка измерений — брак
         return not has_any_value
@@ -1659,9 +1726,23 @@ class MiniOdsEditor(QWidget):
             return
 
         # символика и 'a/b' — не анализируем численно
-        if kind in ('slash', 'symbolic'):
-            self._nonnumeric_tol_cols.add(col)
-            disp = val_disp  # как ввёл человек
+        if kind == 'slash':
+            prev = self.table.item(TOL_ROW, col).text() if self.table.item(TOL_ROW, col) else ""
+            try:
+                pair = self._parse_slash_tolerance(val_disp)
+            except Exception:
+                it_top = self.tolerance_table.item(0, col) or QTableWidgetItem("")
+                if self.tolerance_table.item(0, col) is None:
+                    self.tolerance_table.setItem(0, col, it_top)
+                it_top.setText(prev)
+                QApplication.beep()
+                QMessageBox.warning(self, "Неверный формат допуска", "Ожидалось два числа через слэш, например: -0,025/-0,05")
+                return
+
+            self._slash_tol[col] = pair
+            self._nonnumeric_tol_cols.discard(col)   # это не «символика»
+
+            disp = val_disp  # показываем как ввёл пользователь
 
             it = self.table.item(TOL_ROW, col) or QTableWidgetItem("")
             if self.table.item(TOL_ROW, col) is None:
@@ -1677,9 +1758,10 @@ class MiniOdsEditor(QWidget):
                 self.tolerance_table.setItem(0, col, it_top)
             it_top.setText(disp)
 
+            # без «ОПП»-декора для слэша
             self._changed_tols.pop(col, None)
+
             self._rebuild_tol_cache()
-            self._apply_tol_highlight()
             self.recheck_column(col)
             self._recompute_oos_counts()
             self._recompute_total_defects()
@@ -1779,33 +1861,41 @@ class MiniOdsEditor(QWidget):
                 tol = self._get_tol(c)
                 cnt = 0
 
+                pair = self._slash_tol.get(c)
+                tol  = self._get_tol(c)
+
                 for r in range(FIRST_DATA_ROW, rows):
                     it = self.table.item(r, c)
                     if not it:
                         continue
-
                     txt = (it.text() or "").strip()
                     if not txt:
                         continue
 
                     up = txt.upper()
-
-                    # буквенные маркеры
                     if up in ("N", "Z", "Н", "З"):
                         cnt += 1
                         continue
                     if up in ("Y", "NM", "НМ"):
                         continue
 
-                    # числа — засчитываем только при наличии tol
-                    if tol is None:
-                        continue
-
                     f = try_parse_float(txt)
                     if f is None:
                         continue
-                    if abs(f) > tol:
-                        cnt += 1
+
+                    if pair is not None:
+                        nom_txt = (self.table.item(NOMINAL_ROW, c).text() if self.table.item(NOMINAL_ROW, c) else "")
+                        nom = try_parse_float(nom_txt)
+                        if nom is None:
+                            continue
+                        if not self._check_value_with_slash_pair(nom, f, pair):
+                            cnt += 1
+                    elif tol is not None:
+                        if abs(f) > tol:
+                            cnt += 1
+                    else:
+                        # толеранс нечисловой — пропускаем
+                        pass
 
                 cell.setText(str(cnt))
                 cell.setBackground(WHITE)
