@@ -237,14 +237,14 @@ class MiniOdsEditor(QWidget):
         )
 
         # RIGHT side: vertical stack of header + tolerance + main
-        right_stack = QVBoxLayout()
+        #right_stack = QVBoxLayout()
         # Для левой части создаём такую же «стек»-колонку
-        left_stack = QVBoxLayout()
+        #left_stack = QVBoxLayout()
 
         # нет промежутков и полей — полосы «прилипают»
-        for lay in (left_stack, right_stack):
-            lay.setSpacing(0)
-            lay.setContentsMargins(0, 0, 0, 0)
+        #for lay in (left_stack, right_stack):
+        #    lay.setSpacing(0)
+        #    lay.setContentsMargins(0, 0, 0, 0)
 
         # подпись для нижней строки ("Не в допуске")
         self.info_oos_caption = QTableWidget(1, 1, self)
@@ -427,7 +427,7 @@ class MiniOdsEditor(QWidget):
         f = tw.font(); f.setPointSizeF(UI_FONT_PT + font_inc); tw.setFont(f)
         tw.setStyleSheet("QTableWidget::item { padding: 6px; }")
         tw.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        #tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         # вот эти две строки обеспечат отсутствие полос и колёсика
         tw.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -485,18 +485,26 @@ class MiniOdsEditor(QWidget):
 
     def _check_delta_with_slash_pair(self, delta: float, dev_pair):
         """
-        delta — значение отклонения из ячейки (например, -0.12)
-        dev_pair — (lo, hi) из 'a/b', отсортированы по возрастанию
+        delta — значение отклонения из ячейки (например, -0.12).
+        dev_pair — (lo, hi) из 'a/b', отсортированы по возрастанию.
         """
         lo, hi = dev_pair
         return lo <= delta <= hi
-    
+
+    # совместимость со старыми вызовами
     def _check_value_with_slash_pair(self, nominal: float, value: float, dev_pair):
         return self._check_delta_with_slash_pair(value, dev_pair)
 
     # --- ОПП-хелперы (внутри класса MiniOdsEditor) ---
+    _NUM_RE = r'[-−]?\d+(?:[.,]\d+)?'
+    
     _OPP_RE = re.compile(
         r'^\s*([0-9]+(?:[.,][0-9]+)?)(?:\s*\(\s*ОПП\s*([0-9]+(?:[.,][0-9]+)?)\s*\))?\s*$',
+        re.IGNORECASE
+    )
+
+    _OPP_SLASH_DECOR_RE = re.compile(
+        r'^\s*(' + _NUM_RE + r'\s*[\\/]\s*' + _NUM_RE + r')\s*\(\s*ОПП\s*(' + _NUM_RE + r'\s*[\\/]\s*' + _NUM_RE + r')\s*\)\s*$',
         re.IGNORECASE
     )
     _NUM_DOT_NUM_RE = re.compile(r'^[0-9]+\.[0-9]+$')
@@ -506,7 +514,7 @@ class MiniOdsEditor(QWidget):
     _NUM_SLASH_RE  = re.compile(
         r'^\s*[-−]?\d+(?:[.,]\d+)?\s*[\\/]\s*[-−]?\d+(?:[.,]\d+)?\s*$'
     )
-    _NUM_RE = r'[-−]?\d+(?:[.,]\d+)?'
+
 
     # Токен калибра: буква+цифры ИЛИ цифры+буква; допускаем латиницу/кириллицу
     _FIT_TOKEN     = r'(?:[A-Za-zА-Яа-я]\d+|\d+[A-Za-zА-Яа-я])'
@@ -524,20 +532,24 @@ class MiniOdsEditor(QWidget):
     )
 
     def _extract_tol_kind_and_value(self, s: str):
-        """
-        ('empty'|'numeric'|'slash'|'symbolic'|'invalid', value_str_as_typed)
-        Для 'old (ОПП new)' вернёт ('numeric', new_as_typed).
-        """
         s = (s or '').strip()
         if not s:
             return ('empty', '')
+        # numeric "old (ОПП new)"
         m = self._OPP_DECOR_RE.fullmatch(s)
         if m:
             return ('numeric', m.group(2))
+        # slash "old (ОПП new)"
+        m = self._OPP_SLASH_DECOR_RE.fullmatch(s)
+        if m:
+            return ('slash', m.group(2))
+        # plain number
         if self._NUM_ONLY_RE.fullmatch(s):
             return ('numeric', s)
+        # plain slash
         if self._NUM_SLASH_RE.fullmatch(s):
             return ('slash', s)
+        # символика (D9/6H и проч.)
         if self._SYM_PAIR_RE.fullmatch(s):
             return ('symbolic', s)
         return ('invalid', s)
@@ -615,22 +627,45 @@ class MiniOdsEditor(QWidget):
     def _mark_tol_change(self, col: int):
         if col <= 0 or col >= self.table.columnCount():
             return
-        if col in self._nonnumeric_tol_cols:
-            # заглушка: не учитываем в изменениях/подсветке
+
+        cell = self.table.item(TOL_ROW, col)
+        cur_raw = (cell.text() if cell else "").strip()
+        base_raw = (self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else "").strip()
+
+        # если символика/диапазоны нечисловые (не слэш), выкидываем из учёта
+        if col in self._nonnumeric_tol_cols and not self._is_slash_tol_text(cur_raw):
             self._changed_tols.pop(col, None)
             self._apply_tol_highlight()
             return
 
-        cell = self.table.item(TOL_ROW, col)
-        cur = self._tol_current_part(cell.text() if cell else "")
-        base = self._normalize_to_xdoty(self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else "")
-        if self._canon_tol(cur) is None or self._canon_tol(base) is None:
-            self._changed_tols.pop(col, None)
-        elif self._canon_tol(cur) == self._canon_tol(base):
-            self._changed_tols.pop(col, None)
+        # numeric
+        cur_num = self._tol_current_part(cur_raw)
+        base_num = self._tol_base_left_part(base_raw)
+
+        # slash
+        cur_sl = self._tol_current_slash_part(cur_raw)
+        base_sl = self._slash_base_left_part(base_raw)
+
+        changed = False
+        if cur_sl or base_sl:
+            c = self._canon_slash_pair(cur_sl or "")
+            b = self._canon_slash_pair(base_sl or "")
+            if c is None or b is None or c != b:
+                changed = True
         else:
-            # сохраняем как (old, new)
-            self._changed_tols[col] = (base, cur)
+            c = self._canon_tol(cur_num)
+            b = self._canon_tol(base_num)
+            if (c is None) or (b is None) or (c != b):
+                changed = True
+
+        if changed:
+            # в список изменений кладём «как показано» (чтобы в отчёте выглядело знакомо)
+            new_disp = cur_sl if cur_sl else (cur_num or cur_raw)
+            old_disp = base_sl if base_sl else (base_num or base_raw)
+            self._changed_tols[col] = (old_disp, new_disp)
+        else:
+            self._changed_tols.pop(col, None)
+
         self._apply_tol_highlight()
 
     def _measure_label(self, c: int) -> str:
@@ -664,11 +699,69 @@ class MiniOdsEditor(QWidget):
         for c in sorted(self._changed_tols.keys()):
             old_txt, new_txt = self._changed_tols[c]
             label = self._measure_label(c)
-            items.append(
-                f"<li>Размер <b>{html.escape(label)}</b>: – принять допустимую величину отклонения от номинального размера равной <i>{html.escape(new_txt)}</i> мкм, "
-                f"(вместо <i>{html.escape(old_txt)}</i> мкм).</li>"
-            )
+            if self._is_slash_tol_text(old_txt) or self._is_slash_tol_text(new_txt):
+                phrase = (
+                    f"Размер <b>{html.escape(label)}</b>: – принять диапазон допустимых отклонений "
+                    f"<i>{html.escape(new_txt)}</i> мкм (вместо <i>{html.escape(old_txt)}</i> мкм)."
+                )
+            else:
+                phrase = (
+                    f"Размер <b>{html.escape(label)}</b>: – принять допустимую величину отклонения от номинального размера "
+                    f"равной <i>{html.escape(new_txt)}</i> мкм (вместо <i>{html.escape(old_txt)}</i> мкм)."
+                )
+            items.append(f"<li>{phrase}</li>")
         return "<h3>Изменённые допуски:</h3><ul>" + "".join(items) + "</ul>"
+    
+
+    def _is_slash_tol_text(self, s: str) -> bool:
+        return bool(self._NUM_SLASH_RE.fullmatch((s or '').strip()))
+
+    def _canon_slash_pair(self, s: str):
+        """Вернёт (lo, hi) как float или None, если не слэш/непарсится."""
+        try:
+            lo, hi = self._parse_slash_tolerance(s)
+            return (round(float(lo), 9), round(float(hi), 9))
+        except Exception:
+            return None
+
+    def _tol_current_slash_part(self, s: str) -> str:
+        """
+        Из 'old (ОПП new)' вернёт 'new', из 'a/b' вернёт 'a/b', иначе ''.
+        """
+        s = (s or '').strip()
+        # old/new как пара через слэш
+        opp_slash = re.fullmatch(
+            rf'\s*({self._NUM_RE}\s*[\\/]\s*{self._NUM_RE})\s*\(\s*ОПП\s*({self._NUM_RE}\s*[\\/]\s*{self._NUM_RE})\s*\)\s*',
+            s, re.IGNORECASE
+        )
+        if opp_slash:
+            return opp_slash.group(2)
+        if self._NUM_SLASH_RE.fullmatch(s):
+            return s
+        return ""
+
+    def _slash_base_left_part(self, s: str) -> str:
+        """Левая часть для слэша из 'old (ОПП new)' или сам 'a/b'."""
+        s = (s or '').strip()
+        opp_slash = re.fullmatch(
+            rf'\s*({self._NUM_RE}\s*[\\/]\s*{self._NUM_RE})\s*\(\s*ОПП\s*({self._NUM_RE}\s*[\\/]\s*{self._NUM_RE})\s*\)\s*',
+            s, re.IGNORECASE
+        )
+        if opp_slash:
+            return opp_slash.group(1)
+        if self._NUM_SLASH_RE.fullmatch(s):
+            return s
+        return ""
+    def _count_total_and_good(self):
+        rows = self.table.rowCount()
+        total = 0
+        good = 0
+        for r in range(FIRST_DATA_ROW, rows):
+            if not self._row_is_empty_measurements(r):
+                total += 1
+                if not self._is_row_defective(r):
+                    good += 1
+        return total, good
 
     # ---------- Coloring rules ----------
     def _qcolor_to_xlsx_rgb(self, qc: QColor) -> str:
@@ -728,17 +821,13 @@ class MiniOdsEditor(QWidget):
             # числа и допуски
             f = try_parse_float(text)
             if (row >= FIRST_DATA_ROW) and (col > 0) and f is not None:
-                # 1) слэш-допуск (значение — абсолютное, сравниваем с номиналом)
+                # 1) слэш-допуск: в ячейке хранится Δ (отклонение), сверяем с диапазоном [lo, hi] без номинала
                 pair = self._slash_tol.get(col)
                 if pair is not None:
-                    nom_txt = (self.table.item(NOMINAL_ROW, col).text() if self.table.item(NOMINAL_ROW, col) else "")
-                    nom = try_parse_float(nom_txt)
-                    if nom is not None:
-                        ok = self._check_value_with_slash_pair(nom, f, pair)
-                        it.setBackground(BLUE if ok else RED)
-                        it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
-                        return
-                    # если номинала нет — падаем в старую логику/фолбэк
+                    ok = self._check_delta_with_slash_pair(f, pair)
+                    it.setBackground(BLUE if ok else RED)
+                    it.setForeground(TEXT if it.background().color() != BLACK else WHITE)
+                    return
 
                 # 2) скалярный допуск (старое поведение: считаем, что в ячейке уже Δ)
                 tol = self._get_tol(col)
@@ -791,13 +880,13 @@ class MiniOdsEditor(QWidget):
             it = self.table.item(TOL_ROW, c)
             raw = ((it.text() if it else "") or "").strip()
 
-            # 1) Слэш-формат "num/num" — анализируем
-            if self._NUM_SLASH_RE.fullmatch(raw):
+            # если это слэш или "слэш с ОПП" — берём текущую часть
+            part = self._tol_current_slash_part(raw)  # вернёт 'a/b' либо ''
+            if part:
                 try:
-                    self._slash_tol[c] = self._parse_slash_tolerance(raw)
-                    self._nonnumeric_tol_cols.discard(c)  # это НЕ «символика»
+                    self._slash_tol[c] = self._parse_slash_tolerance(part)
+                    self._nonnumeric_tol_cols.discard(c)
                 except Exception:
-                    # если парс не удался — пусть колонка вообще не считается численно
                     self._nonnumeric_tol_cols.add(c)
                 continue
 
@@ -844,9 +933,8 @@ class MiniOdsEditor(QWidget):
             if f is not None:
                 pair = self._slash_tol.get(c)
                 if pair is not None:
-                    nom_txt = (self.table.item(NOMINAL_ROW, c).text() if self.table.item(NOMINAL_ROW, c) else "")
-                    nom = try_parse_float(nom_txt)
-                    if nom is not None and not self._check_value_with_slash_pair(nom, f, pair):
+                    # дельта уже в ячейке; номинал не нужен
+                    if not self._check_delta_with_slash_pair(f, pair):
                         return True
                 else:
                     tol = self._get_tol(c)
@@ -978,12 +1066,15 @@ class MiniOdsEditor(QWidget):
             fname = os.path.basename(getattr(self, "current_file_path", "") or "")
             header = f"<p style='font-size:12pt;'><b>{html.escape(fname)}</b></p>" if fname else ""
             changed_block = self._changed_tolerances_html()
+            total_parts, good_parts = self._count_total_and_good()
 
             text_page_html = (
                 header +
                 "<h2>Брак:</h2>"
                 f"<p>{bad_html}</p>"
-                f"<p><b>Итого брак:</b> {total_bad}</p>"
+                f"<p><b>Всего деталей:</b> {total_parts}; "
+                f"<b>Годных:</b> {good_parts}; "
+                f"<b>Итого брак:</b> {total_bad}</p>"
                 + (changed_block or "") +
                 "<p><br/></p><p><br/></p>"
                 f"<p>{PDF_ABOUT_TEXT}</p>"
@@ -1437,13 +1528,19 @@ class MiniOdsEditor(QWidget):
             it = self.table.item(TOL_ROW, c)
             raw = (it.text().strip() if it else "")
 
-            if self._is_numeric_or_decorated_tol(raw):
-                # сохраняем "old" в ВИДЕ, как он показан (для красоты),
-                # но численные сравнения делаем через try_parse_float(...)
+            # 1) Слэш: plain 'a/b' ИЛИ 'a/b (ОПП x/y)' → берём ЛЕВУЮ часть как базу
+            sl_base = self._slash_base_left_part(raw)
+            if sl_base:
+                self._orig_tol_texts.append(sl_base)
+                display = raw
+                self._nonnumeric_tol_cols.discard(c)
+            # 2) Число: 'n' или 'n (ОПП m)' → берём левую часть как базу
+            elif self._is_numeric_or_decorated_tol(raw):
                 m = self._OPP_DECOR_RE.fullmatch(raw)
                 old_disp = m.group(1) if m else raw
                 self._orig_tol_texts.append(old_disp)
-                display = raw  # ничего не меняем в UI
+                display = raw
+            # 3) Символика/диапазоны — в «нечисловые»
             else:
                 self._nonnumeric_tol_cols.add(c)
                 self._orig_tol_texts.append(raw)
@@ -1667,16 +1764,27 @@ class MiniOdsEditor(QWidget):
 
     def _format_tol_with_opp_display(self, new_display_str: str, col: int) -> str:
         """
-        Строит отображение допусков, уважая исходный формат пользователя.
-        Если new == old по числу — возвращает просто old.
+        Для чисел и для слэша. Если new == old по ЧИСЛАМ, вернём просто old.
         """
         old_disp = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
-        # сравниваем по числам, а не по строкам
-        old_num = try_parse_float(old_disp)
-        new_num = try_parse_float(new_display_str)
+        new_disp = (new_display_str or "").strip()
+
+        # случай: слэш ↔ слэш
+        if self._is_slash_tol_text(old_disp) and self._is_slash_tol_text(new_disp):
+            old_pair = self._canon_slash_pair(old_disp)
+            new_pair = self._canon_slash_pair(new_disp)
+            if old_pair and new_pair and old_pair == new_pair:
+                return old_disp or new_disp
+            return f"{old_disp} (ОПП {new_disp})" if old_disp else new_disp
+
+        # случай: число ↔ число
+        old_num = self._canon_tol(old_disp)
+        new_num = self._canon_tol(new_disp)
         if old_num is not None and new_num is not None and abs(old_num - new_num) < 1e-12:
-            return old_disp or new_display_str
-        return f"{old_disp} (ОПП {new_display_str})" if old_disp else new_display_str
+            return old_disp or new_disp
+
+        # разный тип (число vs слэш) — просто показываем ОПП
+        return f"{old_disp} (ОПП {new_disp})" if old_disp else new_disp
 
     def _format_tol_with_opp(self, cur_txt: str, col: int) -> str:
         """Показываем: 'old (ОПП new)'; если old==new — только 'old'."""
@@ -1727,9 +1835,10 @@ class MiniOdsEditor(QWidget):
 
         # символика и 'a/b' — не анализируем численно
         if kind == 'slash':
-            prev = self.table.item(TOL_ROW, col).text() if self.table.item(TOL_ROW, col) else ""
+            new_disp = val_disp.strip()  # сюда уже прилетает "новая" часть thanks to _extract_tol_kind_and_value
+            # валидация пары
             try:
-                pair = self._parse_slash_tolerance(val_disp)
+                _ = self._parse_slash_tolerance(new_disp)
             except Exception:
                 it_top = self.tolerance_table.item(0, col) or QTableWidgetItem("")
                 if self.tolerance_table.item(0, col) is None:
@@ -1739,30 +1848,41 @@ class MiniOdsEditor(QWidget):
                 QMessageBox.warning(self, "Неверный формат допуска", "Ожидалось два числа через слэш, например: -0,025/-0,05")
                 return
 
-            self._slash_tol[col] = pair
-            self._nonnumeric_tol_cols.discard(col)   # это не «символика»
+            self._nonnumeric_tol_cols.discard(col)
 
-            disp = val_disp  # показываем как ввёл пользователь
+            old_disp = self._orig_tol_texts[col] if col < len(self._orig_tol_texts) else ""
+            if not old_disp:
+                # впервые задали слэш — фиксируем базу
+                if col >= len(self._orig_tol_texts):
+                    self._orig_tol_texts.extend([""] * (col + 1 - len(self._orig_tol_texts)))
+                self._orig_tol_texts[col] = new_disp
+                display = new_disp
+            else:
+                # если по числам равно — показываем просто old
+                if self._canon_slash_pair(old_disp) == self._canon_slash_pair(new_disp):
+                    display = old_disp
+                else:
+                    display = f"{old_disp} (ОПП {new_disp})"
 
+            # в таблицы (низ и верх)
             it = self.table.item(TOL_ROW, col) or QTableWidgetItem("")
             if self.table.item(TOL_ROW, col) is None:
                 self.table.setItem(TOL_ROW, col, it)
             try:
                 self.table.blockSignals(True)
-                it.setText(disp); it.setBackground(WHITE)
+                it.setText(display); it.setBackground(WHITE)
             finally:
                 self.table.blockSignals(False)
 
             it_top = self.tolerance_table.item(0, col) or QTableWidgetItem("")
             if self.tolerance_table.item(0, col) is None:
                 self.tolerance_table.setItem(0, col, it_top)
-            it_top.setText(disp)
+            it_top.setText(display)
 
-            # без «ОПП»-декора для слэша
-            self._changed_tols.pop(col, None)
-
+            # обновить кэш и метрики
             self._rebuild_tol_cache()
             self.recheck_column(col)
+            self._mark_tol_change(col)
             self._recompute_oos_counts()
             self._recompute_total_defects()
             return
@@ -1884,11 +2004,7 @@ class MiniOdsEditor(QWidget):
                         continue
 
                     if pair is not None:
-                        nom_txt = (self.table.item(NOMINAL_ROW, c).text() if self.table.item(NOMINAL_ROW, c) else "")
-                        nom = try_parse_float(nom_txt)
-                        if nom is None:
-                            continue
-                        if not self._check_value_with_slash_pair(nom, f, pair):
+                        if not self._check_delta_with_slash_pair(f, pair):
                             cnt += 1
                     elif tol is not None:
                         if abs(f) > tol:
