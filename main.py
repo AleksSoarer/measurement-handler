@@ -800,6 +800,14 @@ class MiniOdsEditor(QWidget):
                 idx = self.table.indexFromItem(it)
                 row = idx.row(); col = idx.column()
 
+            # === NEW: ряды 0..3 всегда белые с чёрным текстом ===
+            if 0 <= row <= 3:
+                it.setBackground(WHITE)
+                it.setForeground(TEXT)
+                return
+
+       
+
             text = (it.text() or "").strip()
             up = text.upper()
 
@@ -1355,7 +1363,7 @@ class MiniOdsEditor(QWidget):
                 it0 = self.table.item(r, 0)
                 if it0 is not None:
                     it0.setBackground(RED if is_bad else WHITE)
-                    it0.setForeground(WHITE if is_bad else TEXT)
+                    it0.setForeground(TEXT)
 
                 # заливка пустой бракованной строки
                 is_empty_line = self._row_is_empty_measurements(r)
@@ -2530,8 +2538,10 @@ class MiniOdsEditor(QWidget):
                 bg = (it.background().color() if it else WHITE)
                 fg = (it.foreground().color() if it else TEXT)
 
+                if c == 0:
+                    fg = TEXT
+
                 cell.border = thin_black
-                # QColor может быть не полностью инициализирован — подстрахуем
                 try:
                     cell.fill = self._cell_fill_for_bg(bg)
                 except Exception:
