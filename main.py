@@ -116,13 +116,31 @@ def _fmt_serial(s: str) -> str:
 def try_parse_float(s: str):
     if s is None:
         return None
-    s = s.strip()
+    s = str(s).strip()
     if not s:
         return None
+
+    # игнорим маркеры, которые не являются числами
     up = s.upper()
-    if up in ("Y", "N", "Z", "NM"):
+    if up in ("Y", "N", "Z", "NM", "Н", "З", "НМ"):
         return None
-    candidate = s.replace('−', '-').replace(',', '.')
+
+    # нормализуем «экзотические» минусы и тонкие/неразрывные пробелы
+    # 2212: minus, 2013/2014: en/em dash, 2012/2010: figure/hyphen
+    # 00A0/202F/2009…: тонкие и неразрывные пробелы
+    for bad, good in (
+        ("\u2212", "-"), ("\u2013", "-"), ("\u2014", "-"),
+        ("\u2012", "-"), ("\u2010", "-"),
+        ("\u00A0", ""), ("\u202F", ""), ("\u2009", ""), ("\u2007", ""),
+        ("\u2002", ""), ("\u2003", "")
+    ):
+        s = s.replace(bad, good)
+
+    # убираем обычные пробелы внутри числа (на всякий)
+    s = s.replace(" ", "")
+
+    # запятая → точка
+    candidate = s.replace(",", ".")
     try:
         return float(candidate)
     except ValueError:
@@ -470,13 +488,35 @@ class MiniOdsEditor(QWidget):
     # ==== Slash tolerance helpers (внутри MiniOdsEditor) ====
     @staticmethod
     def _tof(s: str) -> float:
-        return float(str(s).strip().replace('−', '-').replace(',', '.'))
+        # та же нормализация, что в try_parse_float
+        if s is None:
+            return float("nan")
+        t = str(s).strip()
+        for bad, good in (
+            ("\u2212", "-"), ("\u2013", "-"), ("\u2014", "-"),
+            ("\u2012", "-"), ("\u2010", "-"),
+            ("\u00A0", ""), ("\u202F", ""), ("\u2009", ""), ("\u2007", ""),
+            ("\u2002", ""), ("\u2003", "")
+        ):
+            t = t.replace(bad, good)
+        t = t.replace(" ", "").replace(",", ".")
+        return float(t)
 
     def _parse_slash_tolerance(self, tol_str: str):
         """
-        ' -0,025/-0,05 ' -> ( -0.05, -0.025 )  # по возрастанию
+        '-0,025/-0,05' -> (-0.05, -0.025)  # по возрастанию
         """
-        s = (tol_str or '').strip().replace(' ', '')
+        # НОРМАЛИЗАЦИЯ перед регекспом
+        s = (tol_str or "").strip()
+        for bad, good in (
+            ("\u2212", "-"), ("\u2013", "-"), ("\u2014", "-"),
+            ("\u2012", "-"), ("\u2010", "-"),
+            ("\u00A0", ""), ("\u202F", ""), ("\u2009", ""), ("\u2007", ""),
+            ("\u2002", ""), ("\u2003", "")
+        ):
+            s = s.replace(bad, good)
+        s = s.replace(" ", "")
+        # дальше как было
         m = re.fullmatch(fr'({self._NUM_RE})[\\/]({self._NUM_RE})', s)
         if not m:
             raise ValueError(f"Некорректный формат допуска через слеш: {tol_str!r}")
