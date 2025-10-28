@@ -1358,7 +1358,7 @@ class MiniOdsEditor(QWidget):
                 it_left = self.info_main_table.item(r, 0)
                 if it_left is not None:
                     it_left.setBackground(RED if is_bad else WHITE)
-                    it_left.setForeground(WHITE if is_bad else TEXT)
+                    it_left.setForeground(TEXT)
 
                 it0 = self.table.item(r, 0)
                 if it0 is not None:
