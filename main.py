@@ -122,7 +122,7 @@ def try_parse_float(s: str):
 
     # игнорим маркеры, которые не являются числами
     up = s.upper()
-    if up in ("Y", "N", "Z", "NM", "Н", "З", "НМ"):
+    if up in ("Y", "N", "Z", "T", "NM", "Н", "З", "Т", "НМ"):
         return None
 
     # нормализуем «экзотические» минусы и тонкие/неразрывные пробелы
@@ -861,7 +861,7 @@ class MiniOdsEditor(QWidget):
 
             if up == "NM":
                 it.setBackground(BLACK); it.setForeground(WHITE); return
-            if up in ("N", "Z"):
+            if up in ("N", "Z", "T", "Н", "З", "Т"):
                 it.setBackground(RED); it.setForeground(TEXT); return
             if up == "Y":
                 it.setBackground(GREEN); it.setForeground(TEXT); return
@@ -971,7 +971,7 @@ class MiniOdsEditor(QWidget):
             up = txt.upper()
 
             # буквенные маркеры
-            if up in ("N", "Z", "Н", "З"):
+            if up in ("N", "Z", "T", "Н", "З", "Т"):
                 return True
             if up in ("NM", "НМ", "Y"):
                 continue
@@ -2002,7 +2002,7 @@ class MiniOdsEditor(QWidget):
     def _recompute_oos_counts(self):
         """Посчитать количество ячеек вне допуска по каждому столбцу (c >= 1).
         Вне допуска:
-        - 'N'/'Z' (и 'Н'/'З'),
+        - "N", "Z", "T", "Н", "З", "Т",
         - числа, у которых abs(value) > tol (если tol задан).
         'Y' и 'NM'/'НМ' игнорируем.
         """
@@ -2041,7 +2041,7 @@ class MiniOdsEditor(QWidget):
                         continue
 
                     up = txt.upper()
-                    if up in ("N", "Z", "Н", "З"):
+                    if up in ("N", "Z", "T", "Н", "З", "Т"):
                         cnt += 1
                         continue
                     if up in ("Y", "NM", "НМ"):
