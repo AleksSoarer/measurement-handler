@@ -628,6 +628,10 @@ class MiniOdsEditor(QWidget):
         if self._NUM_DOT_NUM_RE.fullmatch(s):
             return s
         return ""  # невалидно как число
+    
+    def _has_serial(self, r: int) -> bool:
+        it0 = self.table.item(r, 0)
+        return bool((it0.text() if it0 else "").strip())
 
     def _is_numeric_tol_text(self, s: str) -> bool:
         return bool(self._NUM_ONLY_RE.fullmatch((s or '').strip()))
@@ -797,10 +801,11 @@ class MiniOdsEditor(QWidget):
         total = 0
         good = 0
         for r in range(FIRST_DATA_ROW, rows):
-            if not self._row_is_empty_measurements(r):
-                total += 1
-                if not self._is_row_defective(r):
-                    good += 1
+            if not self._has_serial(r):
+                continue
+            total += 1
+            if not self._is_row_defective(r):
+                good += 1
         return total, good
 
     # ---------- Coloring rules ----------
@@ -843,6 +848,10 @@ class MiniOdsEditor(QWidget):
             # === NEW: ряды 0..3 всегда белые с чёрным текстом ===
             if 0 <= row <= 3:
                 it.setBackground(WHITE)
+                it.setForeground(TEXT)
+                return
+            
+            if col == 0:
                 it.setForeground(TEXT)
                 return
 
@@ -949,19 +958,16 @@ class MiniOdsEditor(QWidget):
 
     
     def _is_row_defective(self, r: int) -> bool:
-        """
-        Строка бракована, если:
-        - в любой ячейке c>=1 есть 'N' или 'Z' (а также 'Н'/'З'),
-        - есть число вне допуска,
-        - вся строка измерений пуста (для c>=1).
-        'NM'/'НМ' и 'Y' не считаем браком.
-        """
         cols = self.table.columnCount()
+
+        # === NEW: без серийного номера строка НЕ считается бракованной и вообще игнорируется
+        if not self._has_serial(r):
+            return False
+
         if cols <= 1:
-            return True  # нет измерений — считаем браком
+            return True  # есть серийник, но нет столбцов измерений → брак логически
 
         has_any_value = False
-
         for c in range(1, cols):
             it = self.table.item(r, c)
             txt = (it.text() if it else "").strip()
@@ -969,19 +975,14 @@ class MiniOdsEditor(QWidget):
                 has_any_value = True
 
             up = txt.upper()
-
-            # буквенные маркеры
+            # N/Z/T (включая кириллицу) → брак
             if up in ("N", "Z", "T", "Н", "З", "Т"):
                 return True
-            if up in ("NM", "НМ", "Y"):
-                continue
 
-            # числа -> проверяем по допуску
             f = try_parse_float(txt)
             if f is not None:
                 pair = self._slash_tol.get(c)
                 if pair is not None:
-                    # дельта уже в ячейке; номинал не нужен
                     if not self._check_delta_with_slash_pair(f, pair):
                         return True
                 else:
@@ -989,7 +990,7 @@ class MiniOdsEditor(QWidget):
                     if tol is not None and abs(f) > tol:
                         return True
 
-        # пустая строка измерений — брак
+        # есть серийник, но измерений нет вообще → брак (исключенная деталь)
         return not has_any_value
     
     # ==== default name helpers ====
@@ -1384,17 +1385,32 @@ class MiniOdsEditor(QWidget):
         rows = self.table.rowCount()
         cols = self.table.columnCount()
         if rows <= FIRST_DATA_ROW:
-            self.total_defects_lbl.setText("0")
-            return
+            self.total_defects_lbl.setText("0"); return
 
         total_bad = 0
         self._in_cell_style = True
         try:
             for r in range(FIRST_DATA_ROW, rows):
+                # строки без серийника — нейтральные (не считаем и не красим)
+                if not self._has_serial(r):
+                    it_left = self.info_main_table.item(r, 0)
+                    if it_left is not None:
+                        it_left.setBackground(WHITE); it_left.setForeground(TEXT)
+                    it0 = self.table.item(r, 0)
+                    if it0 is not None:
+                        it0.setBackground(WHITE); it0.setForeground(TEXT)
+                    # подчистим пустые клетки измерений
+                    for c in range(1, cols):
+                        itc = self.table.item(r, c)
+                        if itc and (itc.text() or "").strip() == "":
+                            itc.setBackground(WHITE); itc.setForeground(TEXT)
+                    continue
+
                 is_bad = self._is_row_defective(r)
                 if is_bad:
                     total_bad += 1
 
+                # слева (и в скрытой кол.0) фон красный только если брак И есть серийник
                 it_left = self.info_main_table.item(r, 0)
                 if it_left is not None:
                     it_left.setBackground(RED if is_bad else WHITE)
@@ -1405,21 +1421,19 @@ class MiniOdsEditor(QWidget):
                     it0.setBackground(RED if is_bad else WHITE)
                     it0.setForeground(TEXT)
 
-                # заливка пустой бракованной строки
+                # если брак из-за отсутствия измерений — красим пустые измерения в красный
                 is_empty_line = self._row_is_empty_measurements(r)
                 if is_bad and is_empty_line:
                     for c in range(1, cols):
                         itc = self.table.item(r, c) or QTableWidgetItem("")
                         if self.table.item(r, c) is None:
                             self.table.setItem(r, c, itc)
-                        itc.setBackground(RED)
-                        itc.setForeground(TEXT)
+                        itc.setBackground(RED); itc.setForeground(TEXT)
                 else:
                     for c in range(1, cols):
                         itc = self.table.item(r, c)
                         if itc and (itc.text() or "").strip() == "":
-                            itc.setBackground(WHITE)
-                            itc.setForeground(TEXT)
+                            itc.setBackground(WHITE); itc.setForeground(TEXT)
         finally:
             self._in_cell_style = False
 
@@ -2033,6 +2047,8 @@ class MiniOdsEditor(QWidget):
                 tol  = self._get_tol(c)
 
                 for r in range(FIRST_DATA_ROW, rows):
+                    if not self._has_serial(r):
+                        continue
                     it = self.table.item(r, c)
                     if not it:
                         continue
