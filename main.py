@@ -1810,6 +1810,7 @@ class MiniOdsEditor(QWidget):
             self._ensure_panel_cols()
             self._sync_header_from_main()
             self._sync_tol_from_main()
+            self._snapshot_orig_tolerances()
             self._rebuild_tol_cache()
             self._sync_info_main_from_main()
             self._sync_order_row()
@@ -2320,6 +2321,7 @@ class MiniOdsEditor(QWidget):
             self._ensure_panel_cols()
             self._sync_header_from_main()
             self._sync_tol_from_main()
+            self._snapshot_orig_tolerances()
             self._rebuild_tol_cache()          # ВАЖНО: после загрузки!
             self._sync_info_main_from_main()
             self._sync_order_row()
@@ -2329,7 +2331,7 @@ class MiniOdsEditor(QWidget):
             self._recompute_oos_counts()       # теперь tol на месте
             self._sync_bars_and_captions_height()
             self._recompute_total_defects()
-            self._snapshot_orig_tolerances()
+            
 
             if truncated:
                 QMessageBox.information(
@@ -2530,6 +2532,7 @@ class MiniOdsEditor(QWidget):
             self._ensure_panel_cols()
             self._sync_header_from_main()
             self._sync_tol_from_main()
+            self._snapshot_orig_tolerances()
             self._rebuild_tol_cache()
             self._sync_info_main_from_main()
             self._sync_order_row()
@@ -2539,7 +2542,7 @@ class MiniOdsEditor(QWidget):
             self._recompute_oos_counts()
             self._sync_bars_and_captions_height()
             self._recompute_total_defects()
-            self._snapshot_orig_tolerances()
+            
 
             if truncated:
                 QMessageBox.information(
